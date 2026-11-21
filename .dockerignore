@@ -1,0 +1,5 @@
+maps/
+output.jsonl
+sample/
+.git
+__pycache__
