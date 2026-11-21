@@ -40,6 +40,8 @@ class Warm:
         if src not in sys.path:
             sys.path.insert(0, src)
         os.environ["SKIP_INTEGRATION"] = "0"
+        import unittest  # noqa: sqlglot validates more when it sees unittest loaded, as under pytest
+
         import sqlglot  # noqa
 
         files = maps.head["deps"]["files"]
@@ -120,7 +122,11 @@ class Overlay(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 
     def exec_module(self, module):
         rel, text = self.sources[module.__name__]
-        code = compile(text, os.path.join(self.src, rel), "exec", dont_inherit=True)
+        full = os.path.join(self.src, rel)
+        import linecache
+
+        linecache.cache[full] = (len(text), None, text.splitlines(True), full)
+        code = compile(text, full, "exec", dont_inherit=True)
         exec(code, module.__dict__)
 
 
@@ -666,16 +672,18 @@ def _mentions(code, names):
     return False
 
 
-def state_diff(warm, sources):
+def state_diff(warm, sources, diff=True):
     """Tests that can see what importing the patched `sources` changes.
 
+    With diff=False the patched modules are only loaded (to run tests against
+    them) and just broken imports are reported.
     Returns (bits, notes, broken modules, old namespaces).
     """
     old, order, broken = reload_patched(warm, sources)
     d = Diff(warm, sources.keys())
     d.name_refs = set()
     maps = warm.maps
-    for m in order:
+    for m in order if diff else ():
         if not m.startswith("sqlglot"):
             continue
         if m in broken or m not in sys.modules:

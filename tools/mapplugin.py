@@ -465,6 +465,62 @@ def pytest_collection_finish(session):
         if mod is not None and hasattr(mod, "ProcessPoolExecutor"):
             mod.ProcessPoolExecutor = InlineExecutor
     _install_tracking()
+    _track_dispatch()
+    _snapshot()
+
+
+def _track_dispatch():
+    """The generator caches a per-class dispatch table copied from TRANSFORMS the
+    first time a class is used. Reads of that table count as reads of the
+    TRANSFORMS keys, for every test, not just the first one to build it."""
+    if not TRACK:
+        return
+    gen = sys.modules.get("sqlglot.generator")
+    if gen is None or not hasattr(gen, "_build_dispatch"):
+        print("mapplugin: no generator dispatch to track", file=sys.stderr)
+        return
+    orig = gen._build_dispatch
+
+    def _build_dispatch(cls):
+        d = orig(cls)
+        tr = cls.TRANSFORMS
+        bid = getattr(tr, "_bid", None)
+        if bid is None:
+            return d
+        w = TDict(d)
+        w._bid = bid
+        return w
+
+    gen._build_dispatch = _build_dispatch
+    gen._DISPATCH_CACHE.clear()
+
+
+snap = {}
+
+
+def _snapshot():
+    """Sizes of every module-level container and class namespace after import,
+    to report afterwards which ones tests changed (caches filled at run time)."""
+    for name, mod in list(sys.modules.items()):
+        if mod is None or not name.startswith("sqlglot"):
+            continue
+        for k, v in list(vars(mod).items()):
+            if isinstance(v, (dict, set, list)):
+                snap[f"{name}::{k}"] = (v, len(v))
+    for c in _all_classes():
+        snap[cname(c) + ".__dict__"] = (c, set(vars(c)))
+
+
+def _changed_after_run():
+    out = []
+    for label, (obj, before) in snap.items():
+        if label.endswith(".__dict__"):
+            new = set(vars(obj)) - before
+            if new:
+                out.append(f"{label} +{sorted(new)[:5]}")
+        elif len(obj) != before:
+            out.append(f"{label} {before}->{len(obj)}")
+    return out
 
 
 def _new_rec():
@@ -550,6 +606,7 @@ def pytest_sessionfinish(session):
         bags=bags,
         class_info=class_info,
         module_order=[m for m in sys.modules if m.startswith(("sqlglot", "tests"))],
+        runtime_changes=_changed_after_run(),
     )
     with open(OUT, "wb") as f:
         pickle.dump(data, f)

@@ -130,13 +130,16 @@ def _load(path):
 
 # ---------------------------------------------------------------- one patch
 class Plan:
-    __slots__ = ("bits", "full", "reload", "notes")
+    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable")
 
     def __init__(self):
         self.bits = 0
         self.full = False
-        self.reload = {}  # module name -> (relative path, new source or None)
+        self.reload = {}  # module name -> (path, new source or None): import-time changes
         self.notes = []
+        self.src = {}  # every patched python module -> (path, new source)
+        self.data = {}  # every edited file -> new text, for code that opens it
+        self.runnable = True  # tests can be run against the patched tree
 
 
 def read_source(rel):
@@ -195,6 +198,16 @@ def analyze(maps, text):
             plan.bits |= maps.opens.get(os.path.normpath(p), 0)
             if moved:
                 plan.bits |= maps.opens.get("dir:" + (os.path.dirname(p) or "."), 0)
+        if moved or fp.binary:
+            plan.runnable = False
+        elif fp.hunks:
+            old = read_source(fp.old)
+            try:
+                if old is None:
+                    raise patchfmt.PatchError("missing")
+                plan.data[fp.old] = patchfmt.apply(old, fp.hunks)
+            except patchfmt.PatchError:
+                plan.runnable = False
         for p in paths:
             if p.endswith(".py") and p.startswith(("sqlglot/", "tests/")):
                 break
@@ -215,6 +228,7 @@ def analyze(maps, text):
 
 def _moved_python(maps, plan, fp):
     """A python file created, deleted or renamed."""
+    plan.runnable = False
     if fp.old and fp.old.endswith(".py") and fp.old.startswith(("sqlglot/", "tests/")):
         name = module_name(fp.old)
         for b in maps.lines(fp.old).values():
@@ -264,6 +278,7 @@ def _edited_python(maps, plan, fp):
         return
     is_test = rel.startswith("tests/")
     name = module_name(rel)
+    plan.src[name] = (rel, new)
     oi = old_info(rel, old)
     try:
         ni = PyInfo(new.encode("utf-8", "surrogateescape"))
@@ -272,7 +287,7 @@ def _edited_python(maps, plan, fp):
         if is_test:
             plan.bits |= maps.tests_importing(name)
         else:
-            plan.reload[name] = (rel, new)
+            plan.full = True
         return
     if oi.dump() == ni.dump():
         return  # comments and layout only
@@ -375,7 +390,6 @@ def pack(tests, ms):
     if not tests:
         return []
     order = sorted(tests, key=lambda t: -ms[t])
-    total = sum(ms[t] for t in tests)
     best = None
     for k in range(1, min(MAX_WORKERS, len(order)) + 1):
         loads = [0] * k
@@ -387,59 +401,216 @@ def pack(tests, ms):
         cost = max(loads) + WORKER_MS * k
         if best is None or cost < best[0]:
             best = (cost, groups)
-        if max(loads) <= ms[order[0]] or total / (k + 1) + WORKER_MS * (k + 1) > best[0] + WORKER_MS:
-            if max(loads) <= ms[order[0]]:
-                break
+        if max(loads) <= ms[order[0]]:
+            break
     return [g for g in best[1] if g]
 
 
-# ---------------------------------------------------------------- driver
-def run_child(warm, plan):
-    """Fork, import the patched modules, report what changed as a test set."""
+def pack_cost(tests, ms):
+    groups = pack(tests, ms)
+    if not groups:
+        return 0.0
+    return (max(sum(ms[t] for t in g) for g in groups) + WORKER_MS * len(groups)) / 1000.0
+
+
+# ---------------------------------------------------------------- running tests
+HEAVY_CPU = float(os.environ.get("BLAST_HEAVY", "2.5"))  # never run a test estimated above this
+MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
+VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
+VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
+REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.55"))  # warm-up CPU where the costs were measured
+TMP = os.environ.get("TMPDIR", "/tmp")
+
+
+class Ctx:
+    """What the parent knows about the batch, shared with its children by fork."""
+
+    def __init__(self, maps, tj):
+        self.maps = maps
+        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tj}
+        self.number = {t["id"]: t["number"] for t in tj}
+        self.id_of = {t["number"]: t["id"] for t in tj}
+        self.everything = [t["number"] for t in tj]
+        self.bit_number = [self.number.get(t) for t in maps.tests]
+        self.bit_of = {t: i for i, t in enumerate(maps.tests)}
+        known = {n for n in self.bit_number if n is not None}
+        self.unmapped = [n for n in self.everything if n not in known]
+        self.speed = 2.0
+        try:
+            self.calib = _load(os.path.join(MAPS, "calib.bin"))
+        except OSError:
+            self.calib = None
+
+    def numbers(self, bits):
+        out = []
+        bn = self.bit_number
+        while bits:
+            low = bits & -bits
+            n = bn[low.bit_length() - 1]
+            if n is not None:
+                out.append(n)
+            bits ^= low
+        if out and self.unmapped:
+            out.extend(self.unmapped)
+        return out
+
+    def est(self, test_id):
+        c = self.calib["test_cpu"].get(test_id)
+        return None if c is None else self.speed * c + 0.003
+
+    def run_set(self, bits, fixed):
+        """Which candidate tests to run, and the CPU that is expected to cost.
+
+        Running pays when the tests it may drop cost more to select than to run."""
+        if self.calib is None:
+            return [], 0.0
+        nums = self.numbers(bits)
+        if not nums:
+            return [], 0.0
+        light, heavy = [], []
+        cpu = fixed
+        classes = set()
+        for n in nums:
+            tid = self.id_of[n]
+            e = self.est(tid)
+            if e is None or e > HEAVY_CPU:
+                heavy.append(n)
+            else:
+                light.append(n)
+                cpu += e
+                cls = tid.rsplit("::", 1)[0]
+                if cls not in classes:
+                    classes.add(cls)
+                    cpu += self.speed * self.calib["class_cpu"].get(cls, 0.05)
+        if not light:
+            return [], 0.0
+        gain = pack_cost(nums, self.ms) - pack_cost(heavy, self.ms)
+        if gain <= cpu * MARGIN:
+            return [], 0.0
+        return [self.id_of[n] for n in light], cpu
+
+
+def _send(fd, obj):
+    b = marshal.dumps(obj)
+    os.write(fd, len(b).to_bytes(4, "little") + b)
+
+
+def child_main(ctx, warm, plan, verify, w):
     import engine
 
+    sq = {m: v for m, v in plan.src.items() if m.startswith("sqlglot")}
+    sq.update(plan.reload)
+    tsrc = {m: v for m, v in plan.src.items() if m.startswith("tests")}
+    bits, notes = plan.bits, []
+    if sq:
+        dbits, dnotes, broken, _ = engine.state_diff(warm, sq, diff=bool(plan.reload))
+        bits |= dbits
+        notes += dnotes
+        if broken:
+            _send(w, (bits, notes))
+            return
+    _send(w, (bits, notes))
+    if not verify:
+        return
+    fixed = 0.0 if not sq else 0.0
+    ids_run, cpu = ctx.run_set(bits, fixed)
+    if not ids_run:
+        return
+    import tempfile
+
+    import runner
+
+    t0 = time.process_time()
+    tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
+    runner.prepare(SRC, tsrc, plan.data, tmp)
+    speed = ctx.speed
+    cpu_of = ctx.calib["test_cpu"]
+    failed, _ = runner.run(SRC, ids_run, lambda tid: max(3.0, 6.0 * speed * cpu_of.get(tid, 1.0) + 2.0))
+    for tid in ids_run:
+        if tid not in failed:
+            bits &= ~(1 << ctx.bit_of[tid])
+    notes.append(f"ran {len(ids_run)} est {cpu:.2f}s took {time.process_time() - t0:.2f}s, {len(failed)} failed")
+    _send(w, (bits, notes))
+
+
+def start_child(ctx, warm, plan, verify):
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:
-        code = 0
         try:
             os.close(r)
-            bits, notes, broken, _ = engine.state_diff(warm, plan.reload)
-            payload = marshal.dumps((bits, notes))
+            child_main(ctx, warm, plan, verify, w)
         except BaseException as e:  # noqa
             import traceback
 
-            payload = marshal.dumps((None, [f"child failed: {e!r}", traceback.format_exc()[-1500:]]))
-        try:
-            with os.fdopen(w, "wb") as f:
-                f.write(payload)
+            try:
+                os.write(2, f"child failed: {e!r}\n{traceback.format_exc()[-1500:]}\n".encode())
+            except Exception:
+                pass
         finally:
-            os._exit(code)
+            os._exit(0)
     os.close(w)
     return pid, r
 
 
-def collect_child(pid, r, timeout):
+def _frames(buf):
+    out = []
+    i = 0
+    while i + 4 <= len(buf):
+        n = int.from_bytes(buf[i : i + 4], "little")
+        if i + 4 + n > len(buf):
+            break
+        out.append(marshal.loads(bytes(buf[i + 4 : i + 4 + n])))
+        i += 4 + n
+    return out
+
+
+def run_children(ctx, warm, plans, jobs):
+    """jobs: list of (cid, verify). Two at a time, one per core."""
     import select
 
-    chunks = []
-    end = time.monotonic() + timeout
-    ok = True
-    while True:
-        left = end - time.monotonic()
-        if left <= 0:
-            ok = False
-            break
-        ready, _, _ = select.select([r], [], [], left)
-        if not ready:
-            ok = False
-            break
-        b = os.read(r, 1 << 20)
-        if not b:
-            break
-        chunks.append(b)
+    queue = list(jobs)
+    running = {}  # fd -> [cid, pid, buffer, deadline]
+    while queue or running:
+        while queue and len(running) < 2:
+            cid, verify = queue.pop(0)
+            plan = plans[cid]
+            elapsed = time.monotonic() - T0
+            if elapsed > DEADLINE:
+                if plan.reload:
+                    plan.full = True
+                    plan.notes.append("out of time")
+                continue
+            verify = verify and VERIFY and elapsed < VERIFY_UNTIL
+            try:
+                pid, r = start_child(ctx, warm, plan, verify)
+            except Exception as e:
+                if plan.reload:
+                    plan.full = True
+                plan.notes.append(f"fork failed: {e!r}")
+                continue
+            limit = min(60.0, max(5.0, DEADLINE + 20 - elapsed))
+            running[r] = [cid, pid, bytearray(), time.monotonic() + limit]
+        if not running:
+            continue
+        now = time.monotonic()
+        wait = max(0.0, min(v[3] for v in running.values()) - now)
+        ready, _, _ = select.select(list(running), [], [], wait)
+        for r in ready:
+            b = os.read(r, 1 << 20)
+            if b:
+                running[r][2] += b
+                continue
+            _finish(plans, running.pop(r), r, False)
+        now = time.monotonic()
+        for r in [r for r, v in running.items() if v[3] <= now]:
+            _finish(plans, running.pop(r), r, True)
+
+
+def _finish(plans, entry, r, killed):
+    cid, pid, buf, _ = entry
     os.close(r)
-    if not ok:
+    if killed:
         try:
             os.kill(pid, 9)
         except OSError:
@@ -448,38 +619,34 @@ def collect_child(pid, r, timeout):
         os.waitpid(pid, 0)
     except OSError:
         pass
-    if not ok:
-        return None, ["child timed out"]
+    plan = plans[cid]
+    frames = []
     try:
-        return marshal.loads(b"".join(chunks))
+        frames = _frames(buf)
     except Exception as e:
-        return None, [f"child sent nothing usable: {e!r}"]
+        plan.notes.append(f"bad frames {e!r}")
+    if killed:
+        plan.notes.append("child timed out")
+    if not frames:
+        if plan.reload:
+            plan.full = True  # what changed at import time is unknown
+        plan.notes.append("child gave no answer")
+        return
+    bits, notes = frames[-1]
+    plan.bits = bits
+    plan.notes.extend(notes)
+    if any(n.startswith("broken sqlglot") for n in notes):
+        # a module that no longer imports breaks whatever loads it, often lazily
+        # through the dialect registry: far more tests than any map shows
+        plan.full = True
 
 
+# ---------------------------------------------------------------- driver
 def main():
     with open(os.path.join(DATA, "tests.json"), "rb") as f:
         tj = json.load(f)["tests"]
-    ms = {t["number"]: round(t["seconds"] * 1000) for t in tj}
-    number = {t["id"]: t["number"] for t in tj}
-    everything = [t["number"] for t in tj]
     maps = Maps(MAPS)
-    bit_number = [number.get(t) for t in maps.tests]
-    known = {n for n in bit_number if n is not None}
-    unmapped = [n for n in everything if n not in known]  # tests the maps never saw
-
-    def numbers(bits):
-        out = []
-        i = 0
-        while bits:
-            low = bits & -bits
-            i = low.bit_length() - 1
-            n = bit_number[i]
-            if n is not None:
-                out.append(n)
-            bits ^= low
-        if out and unmapped:
-            out.extend(unmapped)
-        return out
+    ctx = Ctx(maps, tj)
 
     commits_dir = os.path.join(DATA, "commits")
     ids = sorted(f[:-6] for f in os.listdir(commits_dir) if f.endswith(".patch"))
@@ -495,52 +662,71 @@ def main():
             p.notes.append(f"analysis failed: {e!r}")
             plans[cid] = p
 
-    todo = [cid for cid in ids if plans[cid].reload and not plans[cid].full]
-    if todo:
+    jobs = []
+    for cid in ids:
+        p = plans[cid]
+        if p.full:
+            continue
+        if p.reload:
+            jobs.append((cid, p.runnable))
+        elif p.runnable and p.bits and VERIFY and ctx.calib is not None:
+            jobs.append((cid, True))
+    if jobs:
         warm = None
         try:
             import engine
 
+            t0 = time.process_time()
+            _preload_test_deps()  # before sqlglot: it checks whether unittest is loaded
             warm = engine.Warm(SRC, maps)
+            warm_cpu = time.process_time() - t0
+            ctx.speed = min(4.0, max(1.0, warm_cpu / REF_WARM))
+            log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}")
             maps.reads  # load before forking so children share it
         except Exception as e:
             log(f"warm-up failed: {e!r}")
-        running = []
-        queue = list(todo)
-        slots = 2
-        while queue or running:
-            while queue and len(running) < slots:
-                cid = queue.pop(0)
-                if warm is None or time.monotonic() - T0 > DEADLINE:
+        if warm is None:
+            for cid, _ in jobs:
+                if plans[cid].reload:
                     plans[cid].full = True
-                    plans[cid].notes.append("no time or no warm state")
+        else:
+            # verification-only jobs: skip those whose static set is not worth running
+            kept = []
+            for cid, verify in jobs:
+                p = plans[cid]
+                if p.reload:
+                    kept.append((cid, verify))
                     continue
-                try:
-                    pid, r = run_child(warm, plans[cid])
-                    running.append((cid, pid, r))
-                except Exception as e:
-                    plans[cid].full = True
-                    plans[cid].notes.append(f"fork failed: {e!r}")
-            if running:
-                cid, pid, r = running.pop(0)
-                bits, notes = collect_child(pid, r, 60)
-                plans[cid].notes.extend(notes)
-                if bits is None:
-                    plans[cid].full = True
-                else:
-                    plans[cid].bits |= bits
+                sq = [m for m in p.src if m.startswith("sqlglot")]
+                fixed = 0.002 * len(warm.dependents(sq)) * ctx.speed + 0.01
+                if ctx.run_set(p.bits, fixed)[0]:
+                    kept.append((cid, True))
+            # import-time changes first: they matter most if time runs short
+            kept.sort(key=lambda j: not plans[j[0]].reload)
+            run_children(ctx, warm, plans, kept)
 
     out = []
     for cid in ids:
         p = plans[cid]
-        tests = everything if p.full else numbers(p.bits)
-        workers = pack(tests, ms)
+        tests = ctx.everything if p.full else ctx.numbers(p.bits)
+        workers = pack(tests, ctx.ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
             log(cid, "FULL" if p.full else len(tests), "; ".join(p.notes)[:300])
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     log(f"done {len(ids)} commits in {time.monotonic() - T0:.2f}s wall, {time.process_time():.2f}s cpu (parent)")
+
+
+def _preload_test_deps():
+    """Third-party modules the tests import, loaded once before forking."""
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    for m in ("unittest", "unittest.mock", "sqlite3", "decimal", "tempfile", "concurrent.futures",
+              "multiprocessing", "tracemalloc", "pytz", "duckdb", "numpy", "pandas", "pandas.testing"):
+        try:
+            __import__(m)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
