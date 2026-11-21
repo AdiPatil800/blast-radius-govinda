@@ -31,7 +31,7 @@ for g, ids in groups.items():
         os.close(r)
         t0 = time.process_time()
         ct = {}
-        failed, times = runner.run(src, ids, lambda t: 600.0, class_times=ct)
+        failed, times, _ = runner.run(src, ids, lambda t: 600.0, class_times=ct)
         total = time.process_time() - t0
         os.write(w, marshal.dumps((sorted(failed), times, total)))
         os._exit(0)

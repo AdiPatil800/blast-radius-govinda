@@ -76,10 +76,33 @@ class Maps:
             self._lines[rel] = d
         return d
 
+    def _read_entry(self, key):
+        if self._reads is None:
+            self._reads = _load(os.path.join(self.path, "reads.idx"))
+            self._read_cache = {}
+        hit = self._read_cache.get(key)
+        if hit is None:
+            loc = self._reads.get(key)
+            if loc is None:
+                hit = None
+            else:
+                with open(os.path.join(self.path, "reads.bin"), "rb") as f:
+                    f.seek(loc[0])
+                    hit = marshal.loads(f.read(loc[1]))
+            self._read_cache[key] = hit
+        return hit
+
+    def attr_reads(self, cname):
+        """{attribute: tests that read it} for one class."""
+        return self._read_entry("a" + cname) or {}
+
+    def key_reads(self, label):
+        """{key: tests that look it up} for one dict or set, None when not recorded."""
+        return self._read_entry("k" + label)
+
     @property
     def reads(self):
-        if self._reads is None:
-            self._reads = _load(os.path.join(self.path, "reads.bin"))
+        self._read_entry("")
         return self._reads
 
     def subclasses(self, c):
@@ -485,9 +508,23 @@ class Ctx:
         if not light:
             return [], 0.0
         gain = pack_cost(nums, self.ms) - pack_cost(heavy, self.ms)
-        if gain <= cpu * MARGIN:
+        # how often every test of a static selection passes, by its size
+        # (measured on labeled mutants of the pinned commit)
+        n = len(nums)
+        p = 0.2 if n == 1 else 0.33 if n <= 3 else 0.25 if n <= 10 else 0.15 if n <= 50 else 0.35
+        run_cpu = cpu - fixed
+        expected_cpu = fixed + run_cpu * (p + (1 - p) * 0.5)  # a failure stops the run early
+        if p * gain <= expected_cpu * MARGIN:
             return [], 0.0
-        return [self.id_of[n] for n in light], cpu
+        light.sort(key=lambda n: self.est(self.id_of[n]))
+        order = []
+        seen = {}
+        for n in light:  # cheapest first, keeping each class together
+            cls = self.id_of[n].rsplit("::", 1)[0]
+            seen.setdefault(cls, []).append(n)
+        for group in seen.values():
+            order.extend(group)
+        return [self.id_of[n] for n in order], cpu
 
 
 def _send(fd, obj):
@@ -502,8 +539,10 @@ def child_main(ctx, warm, plan, verify, w):
     sq.update(plan.reload)
     tsrc = {m: v for m, v in plan.src.items() if m.startswith("tests")}
     bits, notes = plan.bits, []
+    c0 = time.process_time()
     if sq:
         dbits, dnotes, broken, _ = engine.state_diff(warm, sq, diff=bool(plan.reload))
+        notes.append(f"reload+diff {time.process_time() - c0:.2f}s")
         bits |= dbits
         notes += dnotes
         if broken:
@@ -523,13 +562,34 @@ def child_main(ctx, warm, plan, verify, w):
     t0 = time.process_time()
     tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
     runner.prepare(SRC, tsrc, plan.data, tmp)
+    c1 = time.process_time()
     speed = ctx.speed
     cpu_of = ctx.calib["test_cpu"]
-    failed, _ = runner.run(SRC, ids_run, lambda tid: max(3.0, 6.0 * speed * cpu_of.get(tid, 1.0) + 2.0))
-    for tid in ids_run:
+    est = {tid: ctx.est(tid) or 1.0 for tid in ids_run}
+    nums_all = ctx.numbers(bits)
+
+    def keep_going(failed, done):
+        if not failed:
+            return True
+        # with a failure in hand, the rest only pays if dropping it shrinks the cost
+        left = [t for t in ids_run if t not in done]
+        if not left:
+            return False
+        drop = {ctx.number[t] for t in done if t not in failed}
+        now = [n for n in nums_all if n not in drop]
+        after = [n for n in now if ctx.id_of[n] not in left]
+        return pack_cost(now, ctx.ms) - pack_cost(after, ctx.ms) > sum(est[t] for t in left) * MARGIN
+
+    failed, _, ran = runner.run(
+        SRC, ids_run, lambda tid: 3.0 * est[tid] + 0.3, keep_going=keep_going
+    )
+    for tid in ran:
         if tid not in failed:
             bits &= ~(1 << ctx.bit_of[tid])
-    notes.append(f"ran {len(ids_run)} est {cpu:.2f}s took {time.process_time() - t0:.2f}s, {len(failed)} failed")
+    import shutil
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
     _send(w, (bits, notes))
 
 
@@ -682,7 +742,7 @@ def main():
             warm_cpu = time.process_time() - t0
             ctx.speed = min(4.0, max(1.0, warm_cpu / REF_WARM))
             log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}")
-            maps.reads  # load before forking so children share it
+            maps.reads  # the index, loaded before forking so children share it
         except Exception as e:
             log(f"warm-up failed: {e!r}")
         if warm is None:

@@ -430,9 +430,8 @@ class Diff:
 
     def attr_readers(self, c, attr):
         bits = 0
-        ar = self.maps.reads["attr_reads"]
         for x in self.subs(c):
-            bits |= ar.get(x + "\t" + attr, 0)
+            bits |= self.maps.attr_reads(x).get(attr, 0)
         return bits
 
     def users(self, c):
@@ -443,7 +442,7 @@ class Diff:
         return bits
 
     def key_readers(self, label, keys):
-        kr = self.maps.reads["key_reads"].get(label)
+        kr = self.maps.key_reads(label)
         if kr is None:
             return None
         bits = kr.get(ALL, 0)
@@ -721,13 +720,9 @@ def _class_everything(d, c, seen=None):
     seen.add(id(c))
     ca = cname(c)
     d.bits |= d.users(ca)
-    ar = d.maps.reads["attr_reads"]
-    prefix = ca + "\t"
     for x in d.subs(ca):
-        p = x + "\t"
-        for k, b in ar.items():
-            if k.startswith(p):
-                d.bits |= b
+        for b in d.maps.attr_reads(x).values():
+            d.bits |= b
     for v in vars(c).values():
         if isinstance(v, type) and getattr(v, "__module__", None) == c.__module__:
             _class_everything(d, v, seen)

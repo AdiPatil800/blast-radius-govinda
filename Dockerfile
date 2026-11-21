@@ -11,7 +11,7 @@ RUN pip install -r /app/requirements.lock
 COPY tools/fetch_sqlglot.py /app/tools/fetch_sqlglot.py
 RUN python /app/tools/fetch_sqlglot.py /src
 
-COPY selector.py engine.py patchfmt.py pyscope.py blastkeys.py /app/
+COPY selector.py engine.py runner.py patchfmt.py pyscope.py blastkeys.py /app/
 COPY mapsgz/ /app/maps/
 RUN gunzip /app/maps/*.gz \
  && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app /src/sqlglot/sqlglot /src/sqlglot/tests \

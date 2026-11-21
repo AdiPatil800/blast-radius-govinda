@@ -15,8 +15,8 @@ import time
 import unittest
 
 
-class TestTimeout(Exception):
-    pass
+class TestTimeout(BaseException):
+    """Not an Exception, so code under test cannot swallow it."""
 
 
 class InlineExecutor:
@@ -69,11 +69,15 @@ class Result(unittest.TestResult):
         self.times = {}
         self._t = 0.0
         self.armed = False
+        self.done = set()
+        self.keep_going = None
+        self.timed_out = False
 
     def _key(self, test):
         return (type(test).__module__, type(test).__qualname__, test._testMethodName)
 
     def startTest(self, test):
+        self.timed_out = False
         super().startTest(test)
         self._t = time.process_time()
         self.armed = True
@@ -83,7 +87,12 @@ class Result(unittest.TestResult):
         self.armed = False
         signal.setitimer(signal.ITIMER_REAL, 0)
         self.times[self._key(test)] = time.process_time() - self._t
+        if self.timed_out:
+            self.failed.add(self._key(test))  # however it ended, a test that ran out of time fails
         super().stopTest(test)
+        self.done.add(self._key(test))
+        if self.keep_going is not None and not self.keep_going(self):
+            self.shouldStop = True
 
     def _bad(self, test):
         if isinstance(test, unittest.TestCase) and hasattr(test, "_testMethodName") and type(test).__name__ != "_ErrorHolder":
@@ -159,11 +168,19 @@ def split_id(test_id):
     return path[:-3].replace("/", "."), klass, method
 
 
-def run(src, test_ids, limit_for, patch_pools=True, class_times=None):
-    """Run tests by id. Returns (set of failing ids, {id: cpu seconds})."""
+def run(src, test_ids, limit_for, patch_pools=True, class_times=None, keep_going=None):
+    """Run tests by id, in the order given (grouped by class, classes in order of
+    first appearance). Returns (failing ids, {id: cpu seconds}, ids run).
+
+    keep_going(failed ids, ids run so far) is asked after every test; once it
+    says no, the remaining tests are not run."""
     os.chdir(src)
     unittest.TestCase.subTest = _sub_test
     res = Result(lambda key: limit_for(by_key[key]))
+    if keep_going is not None:
+        res.keep_going = lambda r: keep_going(
+            {by_key[k] for k in r.failed if k in by_key}, {by_key[k] for k in r.done if k in by_key}
+        )
     by_key = {}
     groups = {}
     for tid in test_ids:
@@ -173,11 +190,14 @@ def run(src, test_ids, limit_for, patch_pools=True, class_times=None):
 
     def on_alarm(signum, frame):
         if res.armed:
+            res.timed_out = True
             raise TestTimeout()
 
     signal.signal(signal.SIGALRM, on_alarm)
     failed = set()
     for (modname, klass), methods in groups.items():
+        if res.shouldStop:
+            break
         keys = [(modname, klass, m) for m in methods]
         t_class = time.process_time()
         try:
@@ -200,4 +220,5 @@ def run(src, test_ids, limit_for, patch_pools=True, class_times=None):
         if class_times is not None:
             class_times[(modname, klass)] = time.process_time() - t_class
     failed.update(by_key[k] for k in res.failed if k in by_key)
-    return failed, {by_key[k]: v for k, v in res.times.items() if k in by_key}
+    ran = {by_key[k] for k in res.done if k in by_key} | failed
+    return failed, {by_key[k]: v for k, v in res.times.items() if k in by_key}, ran

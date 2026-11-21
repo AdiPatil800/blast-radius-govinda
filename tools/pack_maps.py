@@ -104,7 +104,19 @@ def main():
     head["import_lines"] = {f: frozenset(d) for f, d in import_lines.items()}
     _dump(os.path.join(out, "head.bin"), head)
     _dump(os.path.join(out, "import_lines.bin"), dict(import_lines))
-    _dump(os.path.join(out, "reads.bin"), dict(attr_reads=dict(attr_reads), key_reads=key_reads))
+    by_class = collections.defaultdict(dict)
+    for k, v in attr_reads.items():
+        c, a = k.split("\t", 1)
+        by_class[c][a] = v
+    rblob = bytearray()
+    rindex = {}
+    for key, val in [("a" + c, d) for c, d in by_class.items()] + [("k" + l, d) for l, d in key_reads.items()]:
+        b = marshal.dumps(val)
+        rindex[key] = (len(rblob), len(b))
+        rblob += b
+    _dump(os.path.join(out, "reads.idx"), rindex)
+    with open(os.path.join(out, "reads.bin"), "wb") as fh:
+        fh.write(rblob)
     blob = bytearray()
     index = {}
     for f, d in sorted(lines.items()):
