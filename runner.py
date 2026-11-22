@@ -15,6 +15,11 @@ import time
 import unittest
 
 
+# Tests seen to run away (out of time, memory or stack) in this process: code that
+# does that can take down a fixture its class shares, and other tests with it.
+RUNAWAY = set()  # (module, class, method)
+
+
 class TestTimeout(BaseException):
     """Not an Exception, so code under test cannot swallow it."""
 
@@ -89,6 +94,7 @@ class Result(unittest.TestResult):
         self.times[self._key(test)] = time.process_time() - self._t
         if self.timed_out:
             self.failed.add(self._key(test))  # however it ended, a test that ran out of time fails
+            RUNAWAY.add(self._key(test))
         super().stopTest(test)
         self.done.add(self._key(test))
         if self.keep_going is not None and not self.keep_going(self):
@@ -102,6 +108,11 @@ class Result(unittest.TestResult):
 
     def addError(self, test, err):
         self._bad(test)
+        try:
+            if issubclass(err[0], (MemoryError, RecursionError)) and hasattr(test, "_testMethodName"):
+                RUNAWAY.add(self._key(test))
+        except Exception:  # noqa
+            pass
 
     def addFailure(self, test, err):
         self._bad(test)

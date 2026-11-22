@@ -951,6 +951,7 @@ SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
 UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.5"))
 UNIT_GIVE_UP = int(os.environ.get("BLAST_UNIT_GIVE_UP", "0"))  # more changed items than this: keep the test
+CHILD_MEM_MB = int(os.environ.get("BLAST_CHILD_MEM_MB", "1200"))  # how much a child may grow
 GC_FREEZE = os.environ.get("BLAST_GC_FREEZE", "1") == "1"
 UNIT_WORTH = float(os.environ.get("BLAST_UNIT_WORTH", "0.9"))  # CPU worth spending per second a cleared test saves
 EXEC = os.environ.get("BLAST_EXEC", "1") == "1"  # settle executed TPC queries by the table sqlglot's executor returns
@@ -1181,6 +1182,15 @@ def child_main(ctx, warm, plan, verify, w):
     except (ValueError, OSError):
         pass
 
+    # ... or eat memory without end: the container's limit is shared by everyone here
+    try:
+        with open("/proc/self/status") as f:
+            data_kb = next(int(line.split()[1]) for line in f if line.startswith("VmData:"))
+        cap = data_kb * 1024 + CHILD_MEM_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
+    except (OSError, ValueError, StopIteration):
+        pass
+
     def more_time():
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit + int(RUN_LIMIT), cpu_limit + int(RUN_LIMIT) + 2))
@@ -1331,6 +1341,15 @@ def child_main(ctx, warm, plan, verify, w):
         notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
         bits = 0
     notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
+    if runner.RUNAWAY:
+        # the change makes a test run away; in a real run that can take down what its
+        # class shares (a process pool, a connection) and fail the class's other tests
+        classes = {(m, c) for m, c, _ in runner.RUNAWAY}
+        for tid, n in ctx.number.items():
+            mod, klass, _ = runner.split_id(tid) if tid.count("::") == 2 else (None, None, None)
+            if (mod, klass) in classes and tid in ctx.bit_of:
+                bits |= 1 << ctx.bit_of[tid]
+        notes.append(f"runaway in {sorted(c for _, c in classes)}: the whole class is kept")
     _send(w, (bits, notes))
 
 
