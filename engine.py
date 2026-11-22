@@ -581,6 +581,17 @@ class Diff:
                 bits |= b
         return bits
 
+    def cover_lines(self, code, lines):
+        """Tests that run any of the given lines of the function's file."""
+        rel = os.path.relpath(code.co_filename, self.warm.src)
+        if rel.startswith("..") or not rel.endswith(".py"):
+            return self.cover_code(code)
+        table = self.maps.lines(rel)
+        bits = 0
+        for ln in lines:
+            bits |= table.get(ln, 0)
+        return bits
+
     # -- comparing namespaces
     def module(self, name, old, new):
         for k in old.keys() | new.keys():
@@ -800,6 +811,116 @@ def _mentions(code, names):
     return False
 
 
+def _tests_using(warm, name_refs):
+    """Tests whose own code uses a changed global of sqlglot: one their file binds
+    with `from <module> import <name> [as alias]`, reaches as an attribute, or
+    names in a string (as mock.patch targets do).
+
+    A use inside a test method selects the tests of that name; a use anywhere
+    else in a test file (a helper, a class body, the module itself) selects every
+    test of the file and of the test files that import it."""
+    import ast
+    import re
+
+    maps = warm.maps
+    deps = maps.head["deps"]
+    homes_of = {name: {home for home, _ in homes} for name, homes in name_refs.items()}
+    if not homes_of:
+        return 0
+    word = re.compile(r"\b(?:" + "|".join(map(re.escape, homes_of)) + r")\b")
+    dotted = {f"{home}.{name}" for name, homes in homes_of.items() for home in homes}
+    by_method = {}
+    for t in maps.head["tests"]:
+        parts = t.split("::")
+        if len(parts) == 3 and "#" not in parts[2]:
+            by_method.setdefault(parts[2], []).append((parts[0], t))
+    bits = 0
+    for mod, rel in deps["files"].items():
+        if not mod.startswith("tests"):
+            continue
+        try:
+            with open(os.path.join(warm.src, rel), encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        if not word.search(text):
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            bits |= maps.file_bits(rel) | maps.tests_importing(mod)
+            continue
+        aliases = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                for a in node.names:
+                    if a.name == "*":
+                        aliases.update(n for n, hs in homes_of.items() if node.module in hs)
+                    elif a.name in homes_of and node.module in homes_of[a.name]:
+                        aliases.add(a.asname or a.name)
+
+        def uses(node):
+            if isinstance(node, ast.Name):
+                return node.id in aliases
+            if isinstance(node, ast.Attribute):
+                return node.attr in homes_of
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return any(d in node.value for d in dotted)
+            return False
+
+        where = set()
+        stack = [(tree, None, None)]
+        while stack:
+            node, cls, fn = stack.pop()
+            for child in ast.iter_child_nodes(node):
+                c, f = cls, fn
+                if fn is None:
+                    if isinstance(child, ast.ClassDef) and cls is None:
+                        c = child.name
+                    elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        f = child.name
+                if uses(child):
+                    where.add((c, f))
+                stack.append((child, c, f))
+        if not where:
+            continue
+        importers = {m for m, ds in deps["deps"].items() if mod in ds}
+        files_ok = {rel} | {deps["files"][m] for m in importers if m in deps["files"]}
+        for cls, fn in where:
+            if cls is not None and fn is not None and fn.startswith("test"):
+                for path, t in by_method.get(fn, ()):
+                    if path in files_ok:
+                        bits |= maps.test_bit(t)
+            else:
+                bits |= maps.file_bits(rel) | maps.tests_importing(mod)
+    return bits
+
+
+def _mention_lines(code, names):
+    """Lines of a function (and of what is nested in it) holding an instruction
+    that names one of `names`; None when that cannot be told for every one."""
+    import dis
+
+    out = set()
+    stack = [code]
+    while stack:
+        c = stack.pop()
+        stack.extend(k for k in c.co_consts if isinstance(k, types.CodeType))
+        if not names.intersection(c.co_names):
+            continue
+        found = False
+        for ins in dis.get_instructions(c):
+            if isinstance(ins.argval, str) and ins.argval in names and ins.opname not in ("LOAD_CONST", "KW_NAMES"):
+                ln = ins.positions.lineno if ins.positions else None
+                if ln is None:
+                    return None
+                out.add(ln)
+                found = True
+        if not found:
+            return None
+    return out
+
+
 def state_diff(warm, sources, diff=True):
     """Tests that can see what importing the patched `sources` changes.
 
@@ -848,15 +969,32 @@ def state_diff(warm, sources, diff=True):
             held = {id(v) for v in ns.values() if isinstance(v, types.ModuleType)}
             for name, homes in d.name_refs.items():
                 for home, obj in homes:
-                    if m == home or (obj is not Diff and ns.get(name, Diff) is obj):
+                    if m == home:
                         names.add(name)
+                    elif obj is not Diff and ns.get(name, Diff) is obj:
+                        # bound to the changed object here too -- unless this module
+                        # makes the object itself and still has the very same one
+                        # (every module's `logging.getLogger("sqlglot")`, say)
+                        now = sys.modules.get(m)
+                        if now is None or vars(now).get(name, Diff) is not obj:
+                            names.add(name)
                     elif id(old_mods.get(home)) in held:
                         names.add(name)
             if not names:
                 continue
             for code in _codes_of(ns, m):
                 if _mentions(code, names):
-                    d.bits |= d.cover_code(code)
+                    lines = _mention_lines(code, names)
+                    if lines is None:
+                        d.bits |= d.cover_code(code)
+                    else:
+                        # only the lines that load the name can see its new value
+                        d.bits |= d.cover_lines(code, lines)
+    if d.name_refs:
+        hit = _tests_using(warm, d.name_refs)
+        if hit:
+            d.notes.append("used by test code")
+            d.bits |= hit
     for m in broken:
         d.notes.append(f"broken {m}: {broken[m]}")
         rel = warm.files.get(m)

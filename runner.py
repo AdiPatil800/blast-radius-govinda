@@ -293,7 +293,11 @@ def run_units(src, jobs, limit_s, patch_pools=True):
     return out
 
 
-def items_changed(src, test_id, indices, digests, give_up=0):
+def _out_of_time(signum, frame):
+    raise TestTimeout()
+
+
+def items_changed(src, test_id, indices, digests, give_up=0, limit_s=3.0):
     """Items of a list-driven executor test for which sqlglot no longer produces
     exactly what it produced at the pinned commit (see unitcheck.py).  None when
     that cannot be told, or when more than `give_up` differ: the caller then
@@ -303,6 +307,7 @@ def items_changed(src, test_id, indices, digests, give_up=0):
     if test_id not in unitcheck.SPECS:
         return None
     os.chdir(src)
+    signal.signal(signal.SIGALRM, _out_of_time)
     try:
         mod = importlib.import_module(split_id(test_id)[0])
         helpers = importlib.import_module("tests.helpers")
@@ -311,10 +316,13 @@ def items_changed(src, test_id, indices, digests, give_up=0):
         for i in indices:
             if i >= len(items) or i >= len(digests) or not digests[i]:
                 return None
+            signal.setitimer(signal.ITIMER_REAL, limit_s)
             try:
-                same = unitcheck.item_digests(kind, mod, items[i]) == list(digests[i])
+                same = unitcheck.item_digests(kind, mod, items[i]) == [v for v in digests[i] if isinstance(v, str)]
             except Exception:
                 same = False  # the item now raises before anything is executed
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
             if not same:
                 changed.append(i)
                 if len(changed) > give_up:
@@ -341,6 +349,7 @@ def items_settled(src, test_id, check, run, digests, exec_cost, worth):
     if test_id not in unitcheck.SPECS:
         return None
     os.chdir(src)
+    signal.signal(signal.SIGALRM, _out_of_time)
     try:
         mod = importlib.import_module(split_id(test_id)[0])
         helpers = importlib.import_module("tests.helpers")
@@ -362,10 +371,15 @@ def items_settled(src, test_id, check, run, digests, exec_cost, worth):
                 left = ahead[k]
             if not worth(left):
                 return False
+            # a change can make a query run practically forever: none gets more
+            # than a few times what it is expected to take
+            signal.setitimer(signal.ITIMER_REAL, 0.5 + 4.0 * (exec_cost(-1) + exec_cost(i)))
             try:
                 r = unitcheck.item_same(kind, mod, items[i], digests[i], inside_only)
             except Exception:
                 r = 0
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
             if not r:
                 return False
             if inside_only:

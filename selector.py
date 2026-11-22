@@ -755,7 +755,7 @@ def pack_cost(tests, ms):
 
 # ---------------------------------------------------------------- running tests
 HEAVY_CPU = float(os.environ.get("BLAST_HEAVY", "2.5"))  # never run a test estimated above this
-MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
+MARGIN = float(os.environ.get("BLAST_MARGIN", "0.75"))
 # Running candidate tests here costs CPU that the board charges in full (the scoring
 # machines are several times slower than where this was tuned) and buys little once
 # equivalent comparison swaps are recognized, so it is off unless asked for.
@@ -977,6 +977,8 @@ def unit_plan(ctx, bits):
         # a failing item or a changed digest ends the work early, so a test that
         # will stay selected costs little; one that will be cleared costs it all
         cost = fixed + 0.6 * est_run + 0.5 * est_check
+        if DEBUG:
+            log(f"  unit {t.rsplit('::', 1)[1]} run {len(run)} check {len(check)} saving {saving:.2f} cost {cost:.2f}")
         if attr is None and (fixed + est_run) * MARGIN > UNIT_WORTH * saving:
             continue
         if UNIT_PASS * saving > cost * MARGIN:
@@ -1071,7 +1073,7 @@ def child_main(ctx, warm, plan, verify, w):
                     SRC, t, check, run, fp, exec_cost, lambda cpu, b=budget: cpu * MARGIN <= b
                 ) is True
                 continue
-            changed = runner.items_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP) if check else []
+            changed = runner.items_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP, 0.5 + 0.2 * ctx.speed) if check else []
             ok[t] = changed is not None and len(run) + len(changed) <= max(len(run), UNIT_GIVE_UP)
             if ok[t] and (run or changed):
                 # items whose optimizer output moved get run in full, like the others
