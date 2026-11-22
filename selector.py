@@ -23,6 +23,7 @@ import ast
 import json
 import marshal
 import os
+import signal
 import sys
 import time
 
@@ -1166,6 +1167,10 @@ def start_child(ctx, warm, plan, verify):
     if pid == 0:
         try:
             os.close(r)
+            # patched code may print: stdout carries the answers and nothing else
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 1)
+            os.close(null)
             child_main(ctx, warm, plan, verify, w)
         except BaseException as e:  # noqa
             import traceback
@@ -1182,6 +1187,7 @@ def start_child(ctx, warm, plan, verify):
                 os.write(2, f"self {plan.cid if hasattr(plan, 'cid') else ''} user {ru.ru_utime:.3f} sys {ru.ru_stime:.3f} minflt {ru.ru_minflt} majflt {ru.ru_majflt}\n".encode())
             os._exit(0)
     os.close(w)
+    STATE["pids"].add(pid)
     return pid, r
 
 
@@ -1249,7 +1255,14 @@ def run_children(ctx, warm, plans, jobs):
 
 
 def _finish(plans, entry, r, killed):
+    _collect(plans, entry, r, killed)
+    if STATE["pending"] is not None:
+        STATE["pending"].discard(entry[0])  # its plan is final now
+
+
+def _collect(plans, entry, r, killed):
     cid, pid, buf, _ = entry
+    STATE["pids"].discard(pid)
     os.close(r)
     if killed:
         try:
@@ -1287,16 +1300,60 @@ def _finish(plans, entry, r, killed):
 
 
 # ---------------------------------------------------------------- driver
+STATE = {"wrote": False, "ctx": None, "plans": {}, "pending": None, "pids": set()}
+WATCHDOG = float(os.environ.get("BLAST_WATCHDOG", "165"))  # seconds of wall clock before the last resort
+
+
+class OutOfTime(BaseException):
+    pass
+
+
+def last_resort(reason):
+    """Something went wrong outside any one commit's handling (or time ran out):
+    print an answer for every commit anyway.  A commit whose selection is settled
+    keeps it; any other gets every test.  Never a missing line, never a miss."""
+    if STATE["wrote"]:
+        return
+    try:
+        log(f"last resort: {reason}")
+        with open(os.path.join(DATA, "tests.json"), "rb") as f:
+            tj = json.load(f)["tests"]
+        ms = {t["number"]: int(round(t["seconds"] * 1000)) for t in tj}
+        everything = sorted(ms)
+        ids = sorted(f[:-6] for f in os.listdir(os.path.join(DATA, "commits")) if f.endswith(".patch"))
+        ctx, plans, pending = STATE["ctx"], STATE["plans"], STATE["pending"]
+        out = []
+        for cid in ids:
+            tests = everything
+            p = plans.get(cid)
+            if ctx is not None and p is not None and not p.full and pending is not None and cid not in pending:
+                try:
+                    tests = ctx.numbers(p.bits)
+                except Exception:
+                    tests = everything
+            out.append(json.dumps({"commit": cid, "workers": pack(tests, ms)}, separators=(",", ":")))
+        STATE["wrote"] = True
+        sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+        sys.stdout.flush()
+    except BaseException as e:  # noqa
+        log(f"last resort failed: {e!r}")
+
+
+def _watchdog(signum, frame):
+    raise OutOfTime()
+
+
 def main():
     with open(os.path.join(DATA, "tests.json"), "rb") as f:
         tj = json.load(f)["tests"]
     maps = Maps(MAPS)
     ctx = Ctx(maps, tj)
+    STATE["ctx"] = ctx
     t_maps = time.process_time()
 
     commits_dir = os.path.join(DATA, "commits")
     ids = sorted(f[:-6] for f in os.listdir(commits_dir) if f.endswith(".patch"))
-    plans = {}
+    plans = STATE["plans"]
     for cid in ids:
         try:
             with open(os.path.join(commits_dir, cid + ".patch"), "rb") as f:
@@ -1309,6 +1366,7 @@ def main():
             plans[cid] = p
 
     t_plan = time.process_time()
+    STATE["pending"] = pending = set()
     jobs = []
     for cid in ids:
         p = plans[cid]
@@ -1320,6 +1378,7 @@ def main():
             slow = WITNESS and any(ctx.ms[n] >= SLOW_MS for n in ctx.numbers(p.bits & ~maps.unit_mask))
             if VERIFY or slow or (UNITS and any(p.bits & maps.test_bit(t) for t in maps.unit_lists)):
                 jobs.append((cid, VERIFY))
+    pending.update(cid for cid, _ in jobs)  # not settled until their child has answered
     if jobs:
         warm = None
         try:
@@ -1391,6 +1450,7 @@ def main():
             # import-time changes first: they matter most if time runs short
             kept.sort(key=lambda j: not plans[j[0]].reload)
             run_children(ctx, warm, plans, kept)
+    pending.clear()
 
     out = []
     for cid in ids:
@@ -1404,6 +1464,8 @@ def main():
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
             log(cid, "FULL" if p.full else len(tests), "; ".join(p.notes)[-300:])
+    signal.alarm(0)
+    STATE["wrote"] = True
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     log(f"done {len(ids)} commits in {time.monotonic() - T0:.2f}s wall, {time.process_time():.2f}s cpu (parent): "
@@ -1422,4 +1484,23 @@ def _preload_test_deps():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        signal.signal(signal.SIGALRM, _watchdog)
+        signal.alarm(max(1, int(WATCHDOG - (time.monotonic() - T0))))
+        main()
+    except BaseException as e:  # noqa
+        import traceback
+
+        try:
+            signal.alarm(0)
+            log("".join(traceback.format_exception(type(e), e, e.__traceback__))[-2000:])
+        except BaseException:  # noqa
+            pass
+        last_resort(repr(e))
+        sys.stdout.flush()
+        for pid in list(STATE["pids"]):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        os._exit(0)  # children still running must not hold the container
