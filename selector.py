@@ -181,6 +181,10 @@ class Maps:
             if rel:
                 bits |= self.file_bits(rel)
             stack.extend(rdeps.get(m, ()))
+            # a package is imported by everything inside it, whether or not any
+            # import statement names it
+            inside = m + "."
+            stack.extend(x for x in deps["files"] if x.startswith(inside) and x not in seen)
         return bits
 
 
