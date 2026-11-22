@@ -102,6 +102,15 @@ class Maps:
         return self._read_entry("k" + label)
 
     @property
+    def lazy(self):
+        if not hasattr(self, "_lazy"):
+            try:
+                self._lazy = _load(os.path.join(self.path, "lazy.bin"))
+            except OSError:
+                self._lazy = {}
+        return self._lazy
+
+    @property
     def probe(self):
         if not hasattr(self, "_probe"):
             try:
@@ -168,7 +177,7 @@ def _load(path):
 
 # ---------------------------------------------------------------- one patch
 class Plan:
-    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable")
+    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only")
 
     def __init__(self):
         self.bits = 0
@@ -178,6 +187,7 @@ class Plan:
         self.src = {}  # every patched python module -> (path, new source)
         self.data = {}  # every edited file -> new text, for code that opens it
         self.runnable = True  # tests can be run against the patched tree
+        self.source_only = True  # the patch only edits sqlglot's own python files
 
 
 def read_source(rel):
@@ -237,6 +247,10 @@ def analyze(maps, text):
         if plan.full:
             return plan
         python = any(p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) for p in paths)
+        if moved or fp.binary or not all(p.endswith(".py") and p.startswith("sqlglot/") for p in paths):
+            plan.source_only = False
+        if any(p.endswith(".py") and not p.startswith(("sqlglot/", "tests/")) for p in paths):
+            plan.runnable = False  # scripts run by path are read straight from disk
         if not moved and not fp.binary and _only_sql_comments(fp):
             continue  # the fixture loader drops these lines before any test sees them
         # whoever opens the file, or lists its directory when it appears or disappears
@@ -431,6 +445,7 @@ def _edited_python(maps, plan, fp):
         return
     lines = maps.lines(rel)
     imp = maps.head["import_lines"].get(rel, frozenset())
+    lazy = maps.lazy.get(rel, ())
     need = False
     same_names = oi.names == ni.names
     if not same_names:
@@ -449,6 +464,10 @@ def _edited_python(maps, plan, fp):
             if ln in imp and sc.owns_body(ln):
                 return True
         return False
+
+    def order_dependent(sc):
+        # code on the lazy dialect-loading path: who runs it depends on test order
+        return any(sc.start <= ln <= sc.end for ln in lazy)
 
     bits = 0
     for block_old, block_new in blocks:
@@ -469,6 +488,10 @@ def _edited_python(maps, plan, fp):
                 continue
             if runs_at_import(sc):
                 need = True
+            if order_dependent(sc):
+                plan.full = True
+                plan.notes.append(f"{rel}: lazy loading path")
+                return
             if sc.kind == "lambda":
                 bits |= cover(range(sc.start, sc.end + 1))
                 continue
@@ -487,6 +510,10 @@ def _edited_python(maps, plan, fp):
                     continue
                 if runs_at_import(oc):
                     need = True
+                if order_dependent(oc):
+                    plan.full = True
+                    plan.notes.append(f"{rel}: lazy loading path")
+                    return
                 bits |= cover(range(oc.start, oc.end + 1))
     plan.bits |= bits
     if need:
@@ -611,6 +638,8 @@ VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test
 REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.55"))  # warm-up CPU where the costs were measured
 TMP = os.environ.get("TMPDIR", "/tmp")
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
+INFER = os.environ.get("BLAST_INFER", "0") == "1"
+INFER_MIN = int(os.environ.get("BLAST_INFER_MIN", "1"))
 
 
 class Ctx:
@@ -650,7 +679,7 @@ class Ctx:
         c = self.calib["test_cpu"].get(test_id)
         return None if c is None else self.speed * c + 0.003
 
-    def run_set(self, bits, fixed):
+    def run_set(self, bits, fixed, infer=False):
         """Which candidate tests to run, and the CPU that is expected to cost.
 
         Running pays when the tests it may drop cost more to select than to run."""
@@ -677,6 +706,8 @@ class Ctx:
         if not light:
             return [], 0.0
         gain = pack_cost(nums, self.ms) - pack_cost(heavy, self.ms)
+        if infer and heavy:
+            gain = pack_cost(nums, self.ms)  # passing light tests may clear the heavy ones too
         # how often every test of a static selection passes, by its size
         # (measured on labeled mutants of the pinned commit)
         n = len(nums)
@@ -730,7 +761,8 @@ def child_main(ctx, warm, plan, verify, w):
     if not verify:
         return
     fixed = 0.0 if not sq else 0.0
-    ids_run, cpu = ctx.run_set(bits, fixed)
+    infer = INFER and plan.source_only
+    ids_run, cpu = ctx.run_set(bits, fixed, infer)
     if not ids_run:
         return
     import tempfile
@@ -764,6 +796,11 @@ def child_main(ctx, warm, plan, verify, w):
     for tid in ran:
         if tid not in failed:
             bits &= ~(1 << ctx.bit_of[tid])
+    if infer and not failed and len(ran) == len(ids_run) and len(ran) >= INFER_MIN:
+        # Experiment: every test cheap enough to run exercises the change and passes;
+        # take that as evidence the expensive ones pass too.
+        notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
+        bits = 0
     import shutil
 
     shutil.rmtree(tmp, ignore_errors=True)
@@ -941,7 +978,7 @@ def main():
                     continue
                 sq = [m for m in p.src if m.startswith("sqlglot")]
                 fixed = 0.002 * len(warm.dependents(sq)) * ctx.speed + 0.01
-                if ctx.run_set(p.bits, fixed)[0]:
+                if ctx.run_set(p.bits, fixed, INFER and p.source_only)[0]:
                     kept.append((cid, True))
             # import-time changes first: they matter most if time runs short
             kept.sort(key=lambda j: not plans[j[0]].reload)

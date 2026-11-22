@@ -35,6 +35,9 @@ from blastkeys import ALL, cname, knorm
 REPO = os.getcwd()
 OUT = os.environ.get("MAP_OUT", "/tmp/rawmap.pickle")
 TRACK = os.environ.get("MAP_TRACK", "1") == "1"
+# MAP_PRELOAD=0 records a run where dialects load lazily, as in a plain pytest run;
+# it shows which lines only run on the first use of a dialect in a process
+PRELOAD = os.environ.get("MAP_PRELOAD", "1") == "1"
 TOOL = 4
 mon = sys.monitoring
 DISABLE = mon.DISABLE
@@ -81,6 +84,17 @@ def on_line(code, line):
             if s is None:
                 s = import_lines[key] = set()
             s.add(import_stack[-1])
+        return None
+    if import_stack:
+        # a module being imported lazily during a test (only when not preloaded)
+        rel = _rel(code.co_filename)
+        if rel is None:
+            return DISABLE
+        key = (rel, line)
+        s = import_lines.get(key)
+        if s is None:
+            s = import_lines[key] = set()
+        s.add(import_stack[-1])
         return None
     s = cur_lines
     if s is not None:
@@ -443,7 +457,8 @@ def pytest_configure(config):
     mon.use_tool_id(TOOL, "blastmap")
     mon.register_callback(TOOL, mon.events.LINE, on_line)
     mon.set_events(TOOL, mon.events.LINE)
-    _preload()
+    if PRELOAD:
+        _preload()
 
 
 @pytest.hookimpl(wrapper=True)
