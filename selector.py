@@ -546,6 +546,15 @@ def _edited_python(maps, plan, fp):
                 plan.full = True
                 plan.notes.append(f"{rel}: lazy loading path")
                 return
+    if not is_test:
+        for sc in list(oi.scopes) + list(ni.scopes):
+            lines = old_lines if sc in oi.scopes else new_lines
+            if sc.qual == "__getattr__" and any(sc.start <= ln <= sc.end for ln in lines):
+                # a module resolving names on demand runs this once per name and
+                # process: which tests run it depends on test order
+                plan.full = True
+                plan.notes.append(f"{rel}: lazy loading path (module __getattr__)")
+                return
     plan.bits |= maps.opens.get(os.path.normpath(rel), 0)  # tests that read this source file
     if not is_test and _import_level_imports(ni) - _import_level_imports(oi):
         # One test imports sqlglot in a fresh interpreter and checks that no dialect
@@ -1297,6 +1306,8 @@ def _collect(plans, entry, r, killed):
     bits, notes = frames[-1]
     plan.bits = bits
     plan.notes.extend(notes)
+    if any(n.startswith("everything") for n in notes):
+        plan.full = True  # the change reaches code whose users no map can name
     if any(n.startswith("broken sqlglot") for n in notes):
         # a module that no longer imports breaks whatever loads it, often lazily
         # through the dialect registry: far more tests than any map shows

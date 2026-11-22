@@ -404,6 +404,8 @@ class Cmp:
             return self.same(a.__func__, b.__func__, d + 1) and self.same(a.__self__, b.__self__, d + 1)
         if isinstance(a, re.Pattern):
             return a.pattern == b.pattern and a.flags == b.flags
+        if ta.__module__ == "_thread" and ta.__name__ in ("RLock", "lock"):
+            return True  # a fresh lock is the same lock
         if isinstance(a, (types.BuiltinFunctionType, types.MethodDescriptorType, types.WrapperDescriptorType,
                           types.GetSetDescriptorType, types.MemberDescriptorType)):
             return getattr(a, "__qualname__", None) == getattr(b, "__qualname__", None)
@@ -538,6 +540,7 @@ class Diff:
         self.done = set()
         self.purged = set()  # modules that were re-imported
         self.unbound = {}  # name -> modules that no longer provide it
+        self.changed_mods = set()  # modules with a global that changed
 
     # -- map lookups
     def subs(self, c):
@@ -629,6 +632,7 @@ class Diff:
                 self.global_changed(name, k, a, b, old)
 
     def global_changed(self, mod, name, a, b, old_ns):
+        self.changed_mods.add(mod)
         if b is Diff:
             # no longer in the module's namespace: a module with __getattr__ may
             # still supply it (and had only cached it before)
@@ -796,6 +800,7 @@ class Diff:
                 continue
             if now is Diff:
                 self.unbound.setdefault(n, set()).add(m)
+            self.changed_mods.add(m)
             self.notes.append(f"lazy name {m}::{n}")
             self.name_refs.setdefault(n, []).append((m, was))
 
@@ -1023,12 +1028,19 @@ def state_diff(warm, sources, diff=True):
         i += 1
         if x is not y and getattr(x, "__module__", None) in d.purged:
             d.klass(x, y)
+    for m in order if diff else ():
+        if m in d.patched and m in d.changed_mods and m in old and "__getattr__" in old[m]:
+            d.notes.append(f"everything: {m} resolves names on demand and its tables changed")
     done = set()
     for f, g in d.cmp.default_pairs:
         if id(f) not in done:
             done.add(id(f))
             d.notes.append(f"defaults {f.__module__}::{f.__qualname__}")
             d.bits |= d.cover_code(f.__code__)
+            lo, hi = _code_span(f.__code__)
+            rel = os.path.relpath(f.__code__.co_filename, warm.src)
+            if f.__code__.co_name == "__getattr__" or any(lo <= ln <= hi for ln in maps.lazy.get(rel, ())):
+                d.notes.append(f"everything: {f.__qualname__} is on a lazy loading path")
     if d.name_refs:
         # Globals with no read record: select by the functions that mention the name,
         # in modules where that name is bound to the changed object itself (the home
@@ -1055,8 +1067,15 @@ def state_diff(warm, sources, diff=True):
                         names.add(name)
             if not names:
                 continue
+            lazy = maps.lazy.get(warm.files.get(m, ""), ())
             for code in _codes_of(ns, m):
                 if _mentions(code, names):
+                    lo, hi = _code_span(code)
+                    if code.co_name == "__getattr__" or any(lo <= ln <= hi for ln in lazy):
+                        # read on a path that runs once per process (lazy loading):
+                        # which tests run it depends on test order
+                        d.notes.append(f"everything: {sorted(names)} read on the lazy loading path of {m}")
+                        continue
                     lines = _mention_lines(code, names)
                     if lines is None:
                         d.bits |= d.cover_code(code)
