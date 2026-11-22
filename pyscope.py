@@ -100,6 +100,25 @@ class Focus:
                 const.value = value
         return self._keys_nodoc
 
+    def keys_noann(self):
+        """Like keys(), with parameter and return annotations of functions removed."""
+        saved = []
+        for st in self.nodes():
+            for node in ast.walk(st):
+                if isinstance(node, FUNC):
+                    if node.returns is not None:
+                        saved.append((node, "returns", node.returns))
+                        node.returns = None
+                    a = node.args
+                    for arg in a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]:
+                        if arg.annotation is not None:
+                            saved.append((arg, "annotation", arg.annotation))
+                            arg.annotation = None
+        out = [(p, i, n, ast.dump(st)) for p, i, n, st, _ in self.items]
+        for node, field, value in saved:  # the tree itself stays as parsed
+            setattr(node, field, value)
+        return out
+
     def places(self):
         return [(p, i, n) for p, i, n, _, _ in self.items]
 

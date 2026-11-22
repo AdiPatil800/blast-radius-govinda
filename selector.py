@@ -229,6 +229,11 @@ def analyze(maps, text):
                     plan.notes.append(f"test configuration {p}")
             if base in ("sitecustomize.py", "usercustomize.py"):
                 plan.full = True
+            if moved and p == fp.new and _shadows_import(p):
+                # the checkout is first on sys.path: a new top-level module or package
+                # there replaces whatever `import <name>` used to find (say, pandas)
+                plan.full = True
+                plan.notes.append(f"new importable name at the top level: {p}")
         if plan.full:
             return plan
         python = any(p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) for p in paths)
@@ -268,6 +273,15 @@ def analyze(maps, text):
         if plan.full:
             return plan
     return plan
+
+
+def _shadows_import(path):
+    parts = path.split("/")
+    if parts[0] in ("sqlglot", "tests"):
+        return False
+    if len(parts) == 1:
+        return parts[0].endswith((".py", ".pth", ".so", ".pyc"))
+    return len(parts) == 2 and parts[1] in ("__init__.py", "__init__.pyc")
 
 
 def _only_sql_comments(fp):
@@ -410,6 +424,11 @@ def _edited_python(maps, plan, fp):
         # only docstrings differ; nothing in the suite reads them (doctests are not collected)
         plan.notes.append(f"{rel}: docstrings only")
         return
+    if _lazy_annotations(oi.tree) and _lazy_annotations(new_tree) and oi.keys_noann() == ni.keys_noann():
+        # with `from __future__ import annotations`, a function's annotations are
+        # never evaluated; nothing in sqlglot or its tests reads them back
+        plan.notes.append(f"{rel}: function annotations only")
+        return
     lines = maps.lines(rel)
     imp = maps.head["import_lines"].get(rel, frozenset())
     need = False
@@ -533,6 +552,14 @@ def _same_but_ops(a, b, swaps):
     return a == b and type(a) is type(b)
 
 
+def _lazy_annotations(tree):
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            if any(a.name == "annotations" for a in node.names):
+                return True
+    return False
+
+
 def _indent(t):
     return len(t) - len(t.lstrip())
 
@@ -583,6 +610,7 @@ VERIFY = os.environ.get("BLAST_VERIFY", "0") == "1"
 VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
 REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.55"))  # warm-up CPU where the costs were measured
 TMP = os.environ.get("TMPDIR", "/tmp")
+DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
 
 
 class Ctx:
@@ -923,6 +951,8 @@ def main():
     for cid in ids:
         p = plans[cid]
         tests = ctx.everything if p.full else ctx.numbers(p.bits)
+        if DROP_MS and not p.full:
+            tests = [t for t in tests if ctx.ms[t] < DROP_MS]  # experiment: how much do slow tests cost
         workers = pack(tests, ctx.ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
