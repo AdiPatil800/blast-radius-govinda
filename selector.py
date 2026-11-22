@@ -487,10 +487,11 @@ def _config_parses(fp):
 
             tomllib.loads(new)
         else:
-            import configparser
+            # pytest reads ini files with iniconfig, which is stricter than
+            # configparser (a duplicate name is an error, for one)
+            import iniconfig
 
-            cp = configparser.RawConfigParser(strict=True, interpolation=None)
-            cp.read_string(new)
+            iniconfig.IniConfig(fp.old, data=new)
         return True
     except Exception:
         return False
@@ -957,6 +958,9 @@ NO_RUN = {
     "tests/test_generator.py::TestGenerator::test_generator_memory",
     "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
 }
+POOL_CLASSES = ("tests.test_optimizer:TestOptimizer",)
+PROBE = os.environ.get("BLAST_PROBE", "1") == "1"
+PROBE_BUDGET = float(os.environ.get("BLAST_PROBE_BUDGET", "0.8"))  # CPU seconds (at the scoring machines' speed)
 CHILD_MEM_MB = int(os.environ.get("BLAST_CHILD_MEM_MB", "1200"))  # how much a child may grow
 GC_FREEZE = os.environ.get("BLAST_GC_FREEZE", "1") == "1"
 UNIT_WORTH = float(os.environ.get("BLAST_UNIT_WORTH", "0.9"))  # CPU worth spending per second a cleared test saves
@@ -1000,6 +1004,17 @@ class Ctx:
         if out and self.unmapped:
             out.extend(self.unmapped)
         return out
+
+    def pool_tests(self):
+        """Tests of classes whose tests share one process pool (they read the class's
+        `pool` attribute): what breaks the pool for one breaks it for the rest."""
+        if not hasattr(self, "_pool_tests"):
+            out = set()
+            for cname in POOL_CLASSES:
+                bits = (self.maps.attr_reads(cname) or {}).get("pool", 0)
+                out.update(t for t, i in self.bit_of.items() if (bits >> i) & 1 and "#" not in t and t in self.number)
+            self._pool_tests = out
+        return self._pool_tests
 
     def est(self, test_id):
         c = self.calib["test_cpu"].get(test_id)
@@ -1176,6 +1191,36 @@ def _send(fd, obj):
     os.write(fd, len(b).to_bytes(4, "little") + b)
 
 
+def _memory_guard():
+    """End this child if the memory it really uses (resident pages) grows by more
+    than CHILD_MEM_MB.  A limit on address space would also count what threads
+    and allocators merely reserve, which on a machine with many cores is a lot."""
+    try:
+        import threading
+
+        page = os.sysconf("SC_PAGE_SIZE")
+
+        def resident():
+            with open("/proc/self/statm") as f:
+                return int(f.read().split()[1]) * page
+
+        cap = resident() + CHILD_MEM_MB * 1024 * 1024
+    except (OSError, ValueError, IndexError):
+        return  # no /proc here: nothing to watch
+
+    def watch():
+        while True:
+            time.sleep(0.05)
+            try:
+                if resident() > cap:
+                    os.write(2, b"child over its memory allowance\n")
+                    os._exit(0)
+            except (OSError, ValueError, IndexError):
+                return
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def child_main(ctx, warm, plan, verify, w):
     import resource
 
@@ -1189,13 +1234,7 @@ def child_main(ctx, warm, plan, verify, w):
         pass
 
     # ... or eat memory without end: the container's limit is shared by everyone here
-    try:
-        with open("/proc/self/status") as f:
-            data_kb = next(int(line.split()[1]) for line in f if line.startswith("VmData:"))
-        cap = data_kb * 1024 + CHILD_MEM_MB * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
-    except (OSError, ValueError, StopIteration):
-        pass
+    _memory_guard()
 
     def more_time():
         try:
@@ -1303,59 +1342,94 @@ def child_main(ctx, warm, plan, verify, w):
             notes.append(f"witnesses: {len(failed)} of {len(ran)} run failed")
         notes.append(f"witness est {wcpu:.2f}s took {time.process_time() - w0:.2f}s")
         _send(w, (bits, notes))
-    if not verify:
-        return
-    # after a re-import the test modules are imported again; they are small
-    fixed = (0.03 if (swapped or not sq) else 0.08) * ctx.speed
+    ran_here = set()
+    ids_run, cpu = [], 0.0
     infer = INFER and plan.source_only
-    ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer, bool(plan.data) and not plan.src)
-    if not ids_run:
-        return
-    import runner
+    if verify:
+        # after a re-import the test modules are imported again; they are small
+        fixed = (0.03 if (swapped or not sq) else 0.08) * ctx.speed
+        ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer, bool(plan.data) and not plan.src)
+    if ids_run:
+        import runner
 
-    more_time()
-    t0 = time.process_time()
-    prepare()
-    tmp = prepared[0]
-    c1 = time.process_time()
-    speed = ctx.speed
-    cpu_of = ctx.calib["test_cpu"]
-    est = {tid: ctx.est(tid) or 1.0 for tid in ids_run}
-    nums_all = ctx.numbers(bits)
+        more_time()
+        t0 = time.process_time()
+        prepare()
+        c1 = time.process_time()
+        est = {tid: ctx.est(tid) or 1.0 for tid in ids_run}
+        nums_all = ctx.numbers(bits)
 
-    def keep_going(failed, done):
-        if not failed:
-            return True
-        # with a failure in hand, the rest only pays if dropping it shrinks the cost
-        left = [t for t in ids_run if t not in done]
-        if not left:
-            return False
-        drop = {ctx.number[t] for t in done if t not in failed}
-        now = [n for n in nums_all if n not in drop]
-        after = [n for n in now if ctx.id_of[n] not in left]
-        return pack_cost(now, ctx.ms) - pack_cost(after, ctx.ms) > sum(est[t] for t in left) * MARGIN
+        def keep_going(failed, done):
+            if not failed:
+                return True
+            # with a failure in hand, the rest only pays if dropping it shrinks the cost
+            left = [t for t in ids_run if t not in done]
+            if not left:
+                return False
+            drop = {ctx.number[t] for t in done if t not in failed}
+            now = [n for n in nums_all if n not in drop]
+            after = [n for n in now if ctx.id_of[n] not in left]
+            return pack_cost(now, ctx.ms) - pack_cost(after, ctx.ms) > sum(est[t] for t in left) * MARGIN
 
-    failed, _, ran = runner.run(
-        SRC, ids_run, lambda tid: 3.0 * est[tid] + 0.3, keep_going=keep_going
-    )
-    for tid in ran:
-        if tid not in failed:
-            bits &= ~(1 << ctx.bit_of[tid])
-    if infer and not failed and len(ran) == len(ids_run) and len(ran) >= INFER_MIN:
-        # Experiment: every test cheap enough to run exercises the change and passes;
-        # take that as evidence the expensive ones pass too.
-        notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
-        bits = 0
-    notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
-    if runner.RUNAWAY:
-        # the change makes a test run away; in a real run that can take down what its
-        # class shares (a process pool, a connection) and fail the class's other tests
+        failed, _, ran = runner.run(
+            SRC, ids_run, lambda tid: 3.0 * est[tid] + 0.3, keep_going=keep_going
+        )
+        ran_here.update(ran)
+        for tid in ran:
+            if tid not in failed:
+                bits &= ~(1 << ctx.bit_of[tid])
+        if infer and not failed and len(ran) == len(ids_run) and len(ran) >= INFER_MIN:
+            # Experiment: every test cheap enough to run exercises the change and passes;
+            # take that as evidence the expensive ones pass too.
+            notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
+            bits = 0
+        notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
+    if verify and PROBE:
+        # Tests of a class that share a process pool: one whose worker dies, or
+        # whose worker sends back something that cannot be rebuilt, breaks the
+        # pool for every later test of the class.  No map shows that, so the
+        # selected ones not run yet are run here (the cheaper ones, within a
+        # budget) to see whether the change does it.
+        todo = sorted(
+            (tid for tid in ctx.pool_tests()
+             if (bits >> ctx.bit_of[tid]) & 1 and tid not in ran_here and tid not in NO_RUN
+             and (ctx.est(tid) or 99.0) <= HEAVY_CPU),
+            key=lambda tid: ctx.est(tid),
+        )
+        chosen, spent = [], 0.0
+        for tid in todo:  # the cheapest one always, more while the budget lasts
+            if chosen and spent + ctx.est(tid) > PROBE_BUDGET * ctx.speed / 3.3:
+                break
+            chosen.append(tid)
+            spent += ctx.est(tid)
+        if chosen:
+            import runner
+
+            more_time()
+            p0 = time.process_time()
+            prepare()
+            pest = {tid: ctx.est(tid) for tid in chosen}
+            failed2, _, ran2 = runner.run(
+                SRC, chosen, lambda tid: 3.0 * pest[tid] + 0.3, keep_going=lambda failed, done: not runner.RUNAWAY
+            )
+            for tid in ran2:
+                if tid not in failed2:
+                    bits &= ~(1 << ctx.bit_of[tid])
+            notes.append(f"pool probe ran {len(ran2)}/{len(chosen)} in {time.process_time() - p0:.2f}s, {len(failed2)} failed")
+    runner = sys.modules.get("runner")
+    if runner is not None and runner.RUNAWAY:
+        # the change makes a test run away, or breaks a pool its class shares: in a
+        # real run the class's other tests that use the pool fail with it
         classes = {(m, c) for m, c, _ in runner.RUNAWAY}
-        for tid, n in ctx.number.items():
-            mod, klass, _ = runner.split_id(tid) if tid.count("::") == 2 else (None, None, None)
-            if (mod, klass) in classes and tid in ctx.bit_of:
-                bits |= 1 << ctx.bit_of[tid]
-        notes.append(f"runaway in {sorted(c for _, c in classes)}: the whole class is kept")
+        pool = ctx.pool_tests()
+        pooled = {runner.split_id(t)[:2] for t in pool}
+        for tid in ctx.number:
+            if tid.count("::") != 2 or tid not in ctx.bit_of:
+                continue
+            mod, klass, _ = runner.split_id(tid)
+            if (mod, klass) in classes and ((mod, klass) not in pooled or tid in pool):
+                bits |= 1 << ctx.bit_of[tid]  # in a class with a pool: the tests that use it
+        notes.append(f"runaway in {sorted(c for _, c in classes)}: the tests sharing its fixture are kept")
     _send(w, (bits, notes))
 
 
@@ -1625,6 +1699,9 @@ def main():
                     wanted.update(t.split("::")[0] for t in ids_run)
                 if unit_plan(ctx, p.bits, not any(m.startswith("tests") for m in p.src))[0] or witness_plan(ctx, p, p.bits)[0]:
                     kept.append((cid, verify))
+                    continue
+                if verify and PROBE and any((p.bits >> ctx.bit_of[t]) & 1 for t in ctx.pool_tests()):
+                    kept.append((cid, verify))  # for the pool probe
                 elif ids_run:
                     kept.append((cid, True))
             if wanted:

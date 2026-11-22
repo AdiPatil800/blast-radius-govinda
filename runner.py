@@ -18,6 +18,7 @@ import unittest
 # Tests seen to run away (out of time, memory or stack) in this process: code that
 # does that can take down a fixture its class shares, and other tests with it.
 RUNAWAY = set()  # (module, class, method)
+POOL_BROKEN = False  # set while a test runs, when a worker's answer could not be rebuilt
 
 
 class TestTimeout(BaseException):
@@ -37,13 +38,33 @@ class InlineExecutor:
         fut = cf.Future()
         try:
             fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-            res = pickle.loads(pickle.dumps(fn(*args, **kwargs)))
-            fut.set_result(res)
+            try:
+                res = fn(*args, **kwargs)
+            except TestTimeout:
+                raise
+            except BaseException as e:  # noqa
+                self._sent_back(e)  # the worker sends the exception back
+                raise
+            fut.set_result(self._sent_back(res))
         except TestTimeout:
             raise
         except BaseException as e:  # noqa
             fut.set_exception(e)
         return fut
+
+    @staticmethod
+    def _sent_back(obj):
+        """What the test's process receives for what a worker sends.  A worker that
+        cannot pickle its answer reports that as an error; an answer the receiving
+        side cannot rebuild kills the pool's reader, and the pool with it -- every
+        later test sharing the pool then fails too."""
+        data = pickle.dumps(obj)
+        try:
+            return pickle.loads(data)
+        except BaseException:  # noqa
+            global POOL_BROKEN
+            POOL_BROKEN = True
+            raise
 
     def shutdown(self, wait=True, **kw):
         pass
@@ -85,6 +106,8 @@ class Result(unittest.TestResult):
     def startTest(self, test):
         self.timed_out = False
         super().startTest(test)
+        global POOL_BROKEN
+        POOL_BROKEN = False
         self._t = time.process_time()
         self.armed = True
         self._limit = self.limit_for(self._key(test))
@@ -94,6 +117,9 @@ class Result(unittest.TestResult):
         self.armed = False
         signal.setitimer(signal.ITIMER_REAL, 0)
         self.times[self._key(test)] = time.process_time() - self._t
+        if POOL_BROKEN:
+            self.failed.add(self._key(test))
+            RUNAWAY.add(self._key(test))  # the class's shared pool would be gone
         if self.timed_out:
             self.failed.add(self._key(test))  # however it ended, a test that ran out of time fails
             if self.times[self._key(test)] >= 0.7 * self._limit:
