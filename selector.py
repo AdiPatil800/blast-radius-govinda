@@ -1282,6 +1282,7 @@ def main():
                 ctx.speed = float(os.environ["BLAST_SPEED"])  # for repeatable experiments
             # re-importing everything and comparing it costs a few times the first import
             ctx.child_limit = min(15.0, max(4.0, 25.0 * warm_cpu + 2.0))
+            SPEED_SEEN[0] = ctx.speed
             log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}, child limit {ctx.child_limit:.1f}s")
             maps.reads  # the index, loaded before forking so children share it
         except Exception as e:
@@ -1369,32 +1370,18 @@ def _preload_test_deps():
 
 
 def _burn():
-    """Measurement build only: a fixed amount of work after the answers are out,
-    to compare this machine's CPU speed with the one the costs were tuned on."""
-    import sys as _sys
-
-    _sys.path.insert(0, SRC)
+    """Measurement build only: after the answers are out, use CPU for twice as many
+    seconds as the speed factor this run measured, so the factor can be read back
+    from the CPU the board reports."""
     t0 = time.process_time()
-    import sqlglot
-    from sqlglot.executor import execute
-    from sqlglot.optimizer import optimize
+    x = 0
+    while time.process_time() - t0 < 2.0 * SPEED_SEEN[0]:
+        for i in range(20000):
+            x += i * i
+    print(f"burn: speed factor {SPEED_SEEN[0]:.2f}", file=sys.stderr)
 
-    text = open(os.path.join(SRC, "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")).read()
-    stmts = [s for s in text.split(";") if "SELECT" in s.upper()][:120]
-    for _ in range(6):
-        for sql in stmts:
-            try:
-                tree = sqlglot.parse_one(sql)
-                tree.sql(dialect="duckdb")
-                optimize(tree)
-            except Exception:
-                pass
-    t1 = time.process_time()
-    rows = [{"a": i % 97, "b": i, "c": str(i % 13)} for i in range(20000)]
-    for _ in range(18):
-        execute("SELECT a, c, SUM(b) AS s, COUNT(*) AS n FROM x WHERE b % 3 <> 1 GROUP BY a, c ORDER BY s DESC LIMIT 50", tables={"x": rows})
-    t2 = time.process_time()
-    print(f"burn: parse/optimize {t1 - t0:.2f}s, execute {t2 - t1:.2f}s", file=sys.stderr)
+
+SPEED_SEEN = [1.0]
 
 
 if __name__ == "__main__":
