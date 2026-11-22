@@ -910,7 +910,7 @@ def witness_plan(ctx, plan, bits):
     return [t for group in seen.values() for t in group], cpu
 
 
-def unit_plan(ctx, bits):
+def unit_plan(ctx, bits, tests_as_recorded=True):
     """List-driven tests in the selection that can be settled item by item.
 
     Returns ([(test id, attribute, items to run, items to check)], CPU estimate).
@@ -946,7 +946,7 @@ def unit_plan(ctx, bits):
                 check.append(i)
             else:
                 run.append(i)
-        if EXEC and t in EXEC_TESTS and all(i < len(fp) and fp[i] for i in idxs):
+        if EXEC and tests_as_recorded and t in EXEC_TESTS and all(i < len(fp) and fp[i] for i in idxs):
             # settled without DuckDB: digests of what the parser, the optimizer and
             # the transpiler return, and of the table sqlglot's executor returns
             ms_of = lambda i: fp[i][-1] if isinstance(fp[i][-1], int) else 0  # noqa
@@ -1048,7 +1048,9 @@ def child_main(ctx, warm, plan, verify, w):
             prepared.append(tmp)
 
     # list-driven slow tests: run just the items the change reaches
-    jobs, ucpu = unit_plan(ctx, bits)
+    # the comparison with recorded results stands in for the test's own code,
+    # so it is only used while no test file is patched
+    jobs, ucpu = unit_plan(ctx, bits, not tsrc)
     if jobs:
         import runner
 
@@ -1360,7 +1362,7 @@ def main():
                 )
                 if ids_run and in_place:
                     wanted.update(t.split("::")[0] for t in ids_run)
-                if unit_plan(ctx, p.bits)[0] or witness_plan(ctx, p, p.bits)[0]:
+                if unit_plan(ctx, p.bits, not any(m.startswith("tests") for m in p.src))[0] or witness_plan(ctx, p, p.bits)[0]:
                     kept.append((cid, verify))
                 elif ids_run:
                     kept.append((cid, True))
