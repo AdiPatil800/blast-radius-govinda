@@ -1,15 +1,17 @@
-"""pytest plugin: for every single-operator comparison in sqlglot, record over the
-whole test suite at the pinned commit whether its sibling operator would ever
-have given a different answer.
+"""pytest plugin: for every single-operator comparison in sqlglot, record at the
+pinned commit which tests ever see its sibling operator give a different answer.
 
     is      vs ==        is not  vs !=
     <       vs <=        >       vs >=
 
 sqlglot modules are compiled with each such comparison replaced by a call that
 computes the original result (returned unchanged) and also evaluates the
-sibling, noting any execution where the two disagree.  The result maps
-(file, line, column) to flags; a patch that only swaps one of these operators
-where they never disagreed cannot change what any test sees.
+sibling, noting the running test whenever the two disagree.  A patch that only
+swaps one of these operators can change what a test sees only if the two
+operators disagreed at that position during that test; where they never
+disagree for anyone, the swap changes nothing.
+
+This is a value profile of the code, like line coverage: no patch is involved.
 
     SKIP_INTEGRATION=0 PROBE_OUT=/tmp/probe PYTHONPATH=<tools>:. python -m pytest tests -p probeplugin -n 8
 """
@@ -24,42 +26,47 @@ import os
 import pickle
 import sys
 
+import pytest
+
 REPO = os.getcwd()
 OUT = os.environ.get("PROBE_OUT", "/tmp/probe")
 
-EXECUTED, IS_EQ, ISNOT_NE, LT_LE, GT_GE = 1, 2, 4, 8, 16
+EXECUTED, DIFFERS_OUTSIDE_TESTS = 1, 2
 OPS = {
     "Is": operator.is_, "IsNot": operator.is_not, "Eq": operator.eq, "NotEq": operator.ne,
     "Lt": operator.lt, "LtE": operator.le, "Gt": operator.gt, "GtE": operator.ge,
 }
+SIBLING = {
+    "Is": operator.eq, "Eq": operator.is_, "IsNot": operator.ne, "NotEq": operator.is_not,
+    "Lt": operator.le, "LtE": operator.lt, "Gt": operator.ge, "GtE": operator.gt,
+}
 NODES = []  # node id -> (relpath, line, col, op)
+FUNCS = []  # node id -> (operator, sibling)
 FLAGS = []  # node id -> int
-
-
-def _same(x, y):
-    return type(x) is bool and type(y) is bool and x == y
+CUR = None  # set of node ids that disagreed during the running test phase
+by_test = {}  # test id -> set(node id)
+by_class = {}  # "path::Class" -> set(node id), for setUpClass
 
 
 def probe(nid, a, b):
-    op = NODES[nid][3]
-    r = OPS[op](a, b)
-    f = FLAGS[nid] | EXECUTED
+    op, sib = FUNCS[nid]
+    r = op(a, b)
+    f = FLAGS[nid]
+    if not f & EXECUTED:
+        FLAGS[nid] = f = f | EXECUTED
+    c = CUR
+    if (nid in c) if c is not None else (f & DIFFERS_OUTSIDE_TESTS):
+        return r  # already known to disagree here; the sibling can be costly to evaluate
     try:
-        if op in ("Is", "Eq"):
-            if not (f & IS_EQ) and not _same(a is b, a == b):
-                f |= IS_EQ
-        elif op in ("IsNot", "NotEq"):
-            if not (f & ISNOT_NE) and not _same(a is not b, a != b):
-                f |= ISNOT_NE
-        elif op in ("Lt", "LtE"):
-            if not (f & LT_LE) and not _same(a < b, a <= b):
-                f |= LT_LE
+        s = sib(a, b)
+        same = (s is r) if (r is True or r is False) else False
+    except BaseException:  # noqa: the sibling cannot even be evaluated
+        same = False
+    if not same:
+        if c is not None:
+            c.add(nid)
         else:
-            if not (f & GT_GE) and not _same(a > b, a >= b):
-                f |= GT_GE
-    except BaseException:  # noqa: the sibling cannot even be evaluated: never equivalent
-        f |= IS_EQ | ISNOT_NE | LT_LE | GT_GE
-    FLAGS[nid] = f
+            FLAGS[nid] = f | DIFFERS_OUTSIDE_TESTS
     return r
 
 
@@ -76,6 +83,7 @@ class Rewrite(ast.NodeTransformer):
             return node
         nid = len(NODES)
         NODES.append((self.rel, node.lineno, node.col_offset, op))
+        FUNCS.append((OPS[op], SIBLING[op]))
         FLAGS.append(0)
         call = ast.Call(
             func=ast.Name("__blast_probe__", ast.Load()),
@@ -154,12 +162,45 @@ def pytest_collection_finish(session):
             mod.ProcessPoolExecutor = InlineExecutor
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item):
+    # class fixtures run here: what disagrees then counts for the whole class
+    global CUR
+    CUR = by_class.setdefault(item.nodeid.rsplit("::", 1)[0], set())
+    try:
+        return (yield)
+    finally:
+        CUR = None
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item):
+    global CUR
+    CUR = by_test.setdefault(item.nodeid, set())
+    try:
+        return (yield)
+    finally:
+        CUR = None
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item):
+    global CUR
+    CUR = by_test.setdefault(item.nodeid, set())
+    try:
+        return (yield)
+    finally:
+        CUR = None
+
+
 def pytest_sessionfinish(session):
     wid = os.environ.get("PYTEST_XDIST_WORKER", "main")
-    out = {}
-    for (rel, line, col, op), f in zip(NODES, FLAGS):
-        key = (rel, line, col)
-        out[key] = out.get(key, 0) | f
+    key = [n[:3] for n in NODES]
+    out = dict(
+        flags={key[i]: f for i, f in enumerate(FLAGS)},
+        by_test={t: sorted(key[i] for i in s) for t, s in by_test.items() if s},
+        by_class={c: sorted(key[i] for i in s) for c, s in by_class.items() if s},
+    )
     os.makedirs(OUT, exist_ok=True)
     with open(os.path.join(OUT, f"probe_{wid}.bin"), "wb") as fh:
         marshal.dump(out, fh)

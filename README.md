@@ -18,10 +18,16 @@ building the maps.
 
 One more recording, `tools/probeplugin.py`, also comes from the pinned commit alone:
 for every single-operator comparison in sqlglot (`is`/`==`, `is not`/`!=`, `<`/`<=`,
-`>`/`>=`) it notes whether the sibling operator would ever have produced a different
-result at that source position, over every execution in the test suite. It is a value
-profile of the code, in the same spirit as line coverage: "this comparison never
-distinguishes the two operators" is the analogue of "this line never runs".
+`>`/`>=`) it notes during which tests the sibling operator would have produced a
+different result at that source position. It is a value profile of the code, in the
+same spirit as line coverage: "these two operators never disagree here during this
+test" is the analogue of "this line never runs during this test". It is merged over
+several runs with different hash seeds.
+
+`mapplugin.py` also records three tests that loop over a list of independent cases
+(the TPC-H and TPC-DS executor tests) once per case, so a change that reaches only a
+few cases can be checked by running just those cases instead of selecting the whole
+21-second test blind.
 
 At run time (`selector.py`), for each patch:
 
@@ -29,9 +35,9 @@ At run time (`selector.py`), for each patch:
 2. **Edits inside a function body**: the tests that execute the edited statement
    (or the whole function when the edit is not a line-for-line replacement).
    Layout and comment-only edits are recognized by comparing syntax trees.
-   A patch whose only effect is to swap a comparison for its sibling at a position
-   where the two never disagreed (or that never ran) selects nothing, as does one that
-   only touches docstrings (the suite does not collect doctests).
+   A patch whose only effect is to swap a comparison for its sibling selects the tests
+   during which the two operators disagreed at that position (often none). One that
+   only touches docstrings selects nothing (the suite does not collect doctests).
 3. **Edits that take effect at import time** (class attributes, table entries,
    decorators, module constants, functions called during import): a forked
    child re-imports the patched module and its dependents (`engine.py`),

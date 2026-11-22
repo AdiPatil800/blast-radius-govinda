@@ -507,6 +507,14 @@ def _edited_python(maps, plan, fp):
     ni = Focus(new_tree, new_lines)
     if oi.keys() == ni.keys():
         return  # comments and layout only
+    lazy_lines = maps.lazy.get(rel, ())
+    if lazy_lines:
+        for sc in oi.scopes:
+            if any(sc.start <= ln <= sc.end for ln in lazy_lines) and any(sc.start <= ln <= sc.end for ln in old_lines):
+                # the lazy dialect-loading path: which tests run it depends on test order
+                plan.full = True
+                plan.notes.append(f"{rel}: lazy loading path")
+                return
     plan.bits |= maps.opens.get(os.path.normpath(rel), 0)  # tests that read this source file
     if not is_test and _import_level_imports(ni) - _import_level_imports(oi):
         # One test imports sqlglot in a fresh interpreter and checks that no dialect
@@ -515,8 +523,10 @@ def _edited_python(maps, plan, fp):
         if i:
             plan.bits |= i
             plan.notes.append(f"{rel}: new import at import level")
-    if _equivalent_swaps(maps, rel, oi, ni):
-        plan.notes.append(f"{rel}: comparison swap that never changes a result")
+    swap = _swap_tests(maps, rel, oi, ni)
+    if swap is not None:
+        plan.bits |= swap
+        plan.notes.append(f"{rel}: comparison swap, a different result in {bin(swap).count('1')} tests")
         return
     if oi.keys_nodoc() == ni.keys_nodoc():
         # only docstrings differ; nothing in the suite reads them (doctests are not collected)
@@ -616,28 +626,32 @@ SWAPS = {
 }
 
 
-def _equivalent_swaps(maps, rel, old, new):
-    """True when the two versions differ only in comparison operators swapped for
-    a sibling that, over every execution in the recorded test run, gave the same
-    answer (or the comparison never ran)."""
+def _swap_tests(maps, rel, old, new):
+    """For a patch that only swaps comparison operators for their siblings: the
+    tests during which, at the pinned commit, the two operators ever gave
+    different answers at those positions. Only those tests can see the patch.
+    None when the patch is anything else, or the record cannot answer."""
     probe = maps.probe
     if probe is None:
-        return False
+        return None
     if old.places() != new.places():
-        return False
+        return None
     swaps = []
     for x, y in zip(old.nodes(), new.nodes()):
         if not _same_but_ops(x, y, swaps):
-            return False
+            return None
     if not swaps:
-        return False
-    for line, col, flag in swaps:
-        f = probe.get((rel, line, col))
-        if f is None:
-            return False  # not recorded (never instrumented): no claim
-        if f & flag:
-            return False
-    return True
+        return None
+    bits = 0
+    for line, col, _ in swaps:
+        hit = probe.get((rel, line, col))
+        if hit is None:
+            return None  # not recorded: no claim
+        flags, tests = hit
+        if flags & 2:
+            return None  # the operators disagree while sqlglot is being imported
+        bits |= tests
+    return bits
 
 
 def _same_but_ops(a, b, swaps):
