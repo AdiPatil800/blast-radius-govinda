@@ -857,3 +857,67 @@ def _class_everything(d, c, seen=None):
     for v in vars(c).values():
         if isinstance(v, type) and getattr(v, "__module__", None) == c.__module__:
             _class_everything(d, v, seen)
+
+
+# ---------------------------------------------------------------- patching in place
+def function_index(src):
+    """Every sqlglot function object alive in this process, by where its code
+    was defined.  Built once; lets a child swap the code of an edited function
+    without importing anything again."""
+    import gc
+
+    prefix = os.path.join(src, "sqlglot") + os.sep
+    index = {}
+    for o in gc.get_objects():
+        if type(o) is types.FunctionType:
+            c = o.__code__
+            if c.co_filename.startswith(prefix):
+                index.setdefault((c.co_filename, c.co_qualname, c.co_firstlineno), []).append(o)
+    return index
+
+
+def swap_code(warm, rel, old_text, new_text):
+    """Give every function the patch edits its new code, in the loaded sqlglot.
+
+    Only for patches that change function bodies and nothing that runs at import
+    time: the two versions of the file must define the same functions in the
+    same places.  Returns False (having changed nothing) when that does not
+    hold or a function cannot be matched for certain."""
+    full = os.path.join(warm.src, rel)
+    try:
+        old = compile(old_text, full, "exec", dont_inherit=True)
+        new = compile(new_text, full, "exec", dont_inherit=True)
+    except (SyntaxError, ValueError):
+        return False
+    pairs = []
+    seen = {}
+
+    def walk(a, b):
+        ca = [k for k in a.co_consts if isinstance(k, types.CodeType)]
+        cb = [k for k in b.co_consts if isinstance(k, types.CodeType)]
+        if len(ca) != len(cb):
+            return False
+        for x, y in zip(ca, cb):
+            if x.co_name != y.co_name:
+                return False
+            key = (x.co_qualname, x.co_firstlineno)
+            seen[key] = seen.get(key, 0) + 1
+            if not code_same(x, y):
+                pairs.append((key, x, y))
+            if not walk(x, y):
+                return False
+        return True
+
+    if not walk(old, new):
+        return False
+    todo = []
+    for key, x, y in pairs:
+        if seen[key] != 1 or x.co_freevars != y.co_freevars:
+            return False  # two functions on one line, or a different closure shape
+        for f in warm.findex.get((full,) + key, ()):
+            if len(f.__code__.co_freevars) != len(y.co_freevars):
+                return False
+            todo.append((f, y))
+    for f, y in todo:
+        f.__code__ = y
+    return True

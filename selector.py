@@ -190,7 +190,7 @@ def _load(path):
 
 # ---------------------------------------------------------------- one patch
 class Plan:
-    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only", "sites")
+    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only", "sites", "old")
 
     def __init__(self):
         self.bits = 0
@@ -202,6 +202,7 @@ class Plan:
         self.runnable = True  # tests can be run against the patched tree
         self.source_only = True  # the patch only edits sqlglot's own python files
         self.sites = 0  # separate places where it changes code
+        self.old = {}  # module -> original source, for patching function code in place
 
 
 def read_source(rel):
@@ -494,6 +495,7 @@ def _edited_python(maps, plan, fp):
     is_test = rel.startswith("tests/")
     name = module_name(rel)
     plan.src[name] = (rel, new)
+    plan.old[name] = old
     try:
         new_tree = ast.parse(new.encode("utf-8", "surrogateescape"))
     except (SyntaxError, ValueError, RecursionError):
@@ -757,7 +759,7 @@ MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
 # Running candidate tests here costs CPU that the board charges in full (the scoring
 # machines are several times slower than where this was tuned) and buys little once
 # equivalent comparison swaps are recognized, so it is off unless asked for.
-VERIFY = os.environ.get("BLAST_VERIFY", "0") == "1"
+VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
 VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
 REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.095"))  # warm-up CPU where the costs were measured
 TMP = os.environ.get("TMPDIR", "/tmp")
@@ -815,7 +817,7 @@ class Ctx:
         c = self.calib["test_cpu"].get(test_id)
         return None if c is None else self.speed * c + 0.003
 
-    def run_set(self, bits, fixed, infer=False):
+    def run_set(self, bits, fixed, infer=False, data_change=False):
         """Which candidate tests to run, and the CPU that is expected to cost.
 
         Running pays when the tests it may drop cost more to select than to run."""
@@ -847,10 +849,14 @@ class Ctx:
         # how often every test of a static selection passes, by its size
         # (measured on labeled mutants of the pinned commit)
         n = len(nums)
-        p = 0.2 if n == 1 else 0.33 if n <= 3 else 0.25 if n <= 10 else 0.15 if n <= 50 else 0.35
+        p = 0.2 if n == 1 else 0.16 if n <= 10 else 0.2 if n <= 50 else 0.14
+        if data_change:
+            p = 0.03  # an edited fixture nearly always fails the tests that read it
         run_cpu = cpu - fixed
         expected_cpu = fixed + run_cpu * (p + (1 - p) * 0.5)  # a failure stops the run early
-        if p * gain <= expected_cpu * MARGIN:
+        # when some fail, about half of a larger selection still turns out to pass
+        partial = 0.0 if data_change else (1 - p) * 0.45 * max(0.0, gain - WORKER_MS / 1000.0)
+        if p * gain + partial <= expected_cpu * MARGIN:
             return [], 0.0
         light.sort(key=lambda n: self.est(self.id_of[n]))
         order = []
@@ -974,15 +980,15 @@ def child_main(ctx, warm, plan, verify, w):
     import engine
 
     # a patch can make sqlglot spin forever at import; CPU spent here is charged
-    cpu = int(ctx.child_limit) + 1
+    cpu_limit = int(ctx.child_limit) + 1
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + int(RUN_LIMIT) + 2))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + int(RUN_LIMIT) + 2))
     except (ValueError, OSError):
         pass
 
     def more_time():
         try:
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu + int(RUN_LIMIT), cpu + int(RUN_LIMIT) + 2))
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit + int(RUN_LIMIT), cpu_limit + int(RUN_LIMIT) + 2))
         except (ValueError, OSError):
             pass
 
@@ -991,7 +997,13 @@ def child_main(ctx, warm, plan, verify, w):
     tsrc = {m: v for m, v in plan.src.items() if m.startswith("tests")}
     bits, notes = plan.bits, []
     c0 = time.process_time()
-    if sq:
+    swapped = False
+    if sq and not plan.reload and not tsrc and plan.source_only and getattr(warm, "findex", None) is not None:
+        # only function bodies changed: give the loaded functions their new code
+        swapped = all(engine.swap_code(warm, rel, plan.old.get(m, ""), text) for m, (rel, text) in sq.items())
+    if swapped:
+        notes.append("patched in place")
+    elif sq:
         dbits, dnotes, broken, _ = engine.state_diff(warm, sq, diff=bool(plan.reload))
         notes.append(f"reload+diff {time.process_time() - c0:.2f}s")
         bits |= dbits
@@ -1010,9 +1022,10 @@ def child_main(ctx, warm, plan, verify, w):
 
             import runner
 
-            _preload_test_deps()
+            if not swapped:
+                _preload_test_deps()
             tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
-            runner.prepare(SRC, tsrc, plan.data, tmp)
+            runner.prepare(SRC, tsrc, plan.data, tmp, fresh=not swapped)
             prepared.append(tmp)
 
     # list-driven slow tests: run just the items the change reaches
@@ -1067,9 +1080,9 @@ def child_main(ctx, warm, plan, verify, w):
         _send(w, (bits, notes))
     if not verify:
         return
-    fixed = 0.0 if not sq else 0.0
+    fixed = 0.03 * ctx.speed if (swapped or not sq) else 0.3 * ctx.speed
     infer = INFER and plan.source_only
-    ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer)
+    ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer, bool(plan.data) and not plan.src)
     if not ids_run:
         return
     import runner
@@ -1270,8 +1283,6 @@ def main():
                 ctx.speed = float(os.environ["BLAST_SPEED"])  # for repeatable experiments
             # re-importing everything and comparing it costs a few times the first import
             ctx.child_limit = min(15.0, max(4.0, 25.0 * warm_cpu + 2.0))
-            if VERIFY:
-                ctx.child_limit = max(ctx.child_limit, 30.0)
             log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}, child limit {ctx.child_limit:.1f}s")
             maps.reads  # the index, loaded before forking so children share it
         except Exception as e:
@@ -1283,17 +1294,48 @@ def main():
         else:
             # verification-only jobs: skip those whose static set is not worth running
             kept = []
+            wanted = set()
             for cid, verify in jobs:
                 p = plans[cid]
                 if p.reload:
                     kept.append((cid, verify))
                     continue
                 sq = [m for m in p.src if m.startswith("sqlglot")]
-                fixed = 0.002 * len(warm.dependents(sq)) * ctx.speed + 0.01
+                in_place = p.source_only and len(sq) == len(p.src)
+                fixed = (0.03 if in_place or not sq else 0.002 * len(warm.dependents(sq)) + 0.01) * ctx.speed
+                ids_run = (
+                    ctx.run_set(p.bits & ~maps.unit_mask, fixed, INFER and p.source_only, bool(p.data) and not p.src)[0]
+                    if verify
+                    else []
+                )
+                if ids_run and in_place:
+                    wanted.update(t.split("::")[0] for t in ids_run)
                 if unit_plan(ctx, p.bits)[0] or witness_plan(ctx, p, p.bits)[0]:
                     kept.append((cid, verify))
-                elif verify and ctx.run_set(p.bits & ~maps.unit_mask, fixed, INFER and p.source_only)[0]:
+                elif ids_run:
                     kept.append((cid, True))
+            if wanted:
+                # Function-body patches are applied in place in each child, so the test
+                # modules can be imported once here and shared by all of them.
+                import importlib
+
+                t0 = time.process_time()
+                for path in sorted(wanted):
+                    try:
+                        importlib.import_module(path[:-3].replace("/", "."))
+                    except Exception as e:
+                        log(f"cannot import {path}: {e!r}")
+                import resource  # noqa: loaded here so no child pays for importing them
+                import shutil  # noqa
+                import tempfile  # noqa
+
+                import runner  # noqa
+
+                try:
+                    warm.findex = engine.function_index(SRC)
+                except Exception as e:
+                    log(f"no function index: {e!r}")
+                log(f"shared test modules {len(wanted)}, function index, {time.process_time() - t0:.2f}s cpu")
             # import-time changes first: they matter most if time runs short
             kept.sort(key=lambda j: not plans[j[0]].reload)
             run_children(ctx, warm, plans, kept)

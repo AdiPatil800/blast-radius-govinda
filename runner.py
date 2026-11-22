@@ -114,10 +114,12 @@ class Result(unittest.TestResult):
         self._bad(test)
 
 
-def prepare(src, test_sources, data, tmpdir):
+def prepare(src, test_sources, data, tmpdir, fresh=True):
     """Make the tests see the patched tree: fresh imports of every test module
     (patched ones from `test_sources`), and `open` of an edited data file
-    returning its patched text."""
+    returning its patched text.  With fresh=False the test modules already
+    imported are kept: right when sqlglot was patched in place, so that every
+    object they hold is still the one in use."""
     import builtins
     import io
     import linecache
@@ -125,7 +127,7 @@ def prepare(src, test_sources, data, tmpdir):
 
     import engine
 
-    for name in [m for m in sys.modules if m == "tests" or m.startswith("tests.")]:
+    for name in [m for m in sys.modules if m == "tests" or m.startswith("tests.")] if fresh else ():
         del sys.modules[name]
     if test_sources:
         sys.meta_path.insert(0, engine.Overlay(src, test_sources))
