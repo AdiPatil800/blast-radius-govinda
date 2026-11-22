@@ -322,3 +322,56 @@ def items_changed(src, test_id, indices, digests, give_up=0):
         return changed
     except BaseException:  # noqa
         return None
+
+
+def items_settled(src, test_id, check, run, digests, exec_cost, worth):
+    """True when every listed item of a list-driven executor test is shown to end
+    as it did at the pinned commit (see unitcheck.py): the test then passes.
+    `check` items are reached by the change only inside the calls that parse,
+    optimize and transpile the query; `run` items anywhere.  False as soon as one
+    item cannot be shown unchanged; None when nothing could be told.  DuckDB is
+    never asked anything.
+
+    exec_cost(i): CPU expected for running item i through the executor.
+    worth(cpu): whether the work still ahead is worth that much CPU; asked before
+    every item, with the share of checked items that needed the executor so far
+    applied to the ones left."""
+    import unitcheck
+
+    if test_id not in unitcheck.SPECS:
+        return None
+    os.chdir(src)
+    try:
+        mod = importlib.import_module(split_id(test_id)[0])
+        helpers = importlib.import_module("tests.helpers")
+        kind, items = unitcheck.prepare(mod, helpers, test_id)
+        todo = [(i, True) for i in check] + [(i, False) for i in run]
+        ahead = [0.0] * (len(todo) + 1)  # executor cost of the items from k on
+        for k in range(len(todo) - 1, -1, -1):
+            ahead[k] = ahead[k + 1] + exec_cost(todo[k][0])
+        checks_left = len(check)
+        seen = moved = 0
+        for k, (i, inside_only) in enumerate(todo):
+            if i >= len(items) or i >= len(digests) or not digests[i]:
+                return False
+            if inside_only:
+                q = (moved + 0.3) / (seen + 2.0)
+                tail = ahead[len(check)]
+                left = exec_cost(-1) * checks_left + q * (ahead[k] - tail) + tail
+            else:
+                left = ahead[k]
+            if not worth(left):
+                return False
+            try:
+                r = unitcheck.item_same(kind, mod, items[i], digests[i], inside_only)
+            except Exception:
+                r = 0
+            if not r:
+                return False
+            if inside_only:
+                checks_left -= 1
+                seen += 1
+                moved += r == 2
+        return True
+    except BaseException:  # noqa
+        return None

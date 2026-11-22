@@ -761,7 +761,7 @@ MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
 # equivalent comparison swaps are recognized, so it is off unless asked for.
 VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
 VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
-REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.095"))  # warm-up CPU where the costs were measured
+REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.079"))  # warm-up CPU where the costs were measured
 TMP = os.environ.get("TMPDIR", "/tmp")
 RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a child gets once it starts running tests
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
@@ -777,6 +777,13 @@ SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
 UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))
 UNIT_GIVE_UP = int(os.environ.get("BLAST_UNIT_GIVE_UP", "0"))  # more changed items than this: keep the test
+GC_FREEZE = os.environ.get("BLAST_GC_FREEZE", "1") == "1"
+UNIT_WORTH = float(os.environ.get("BLAST_UNIT_WORTH", "0.9"))  # CPU worth spending per second a cleared test saves
+EXEC = os.environ.get("BLAST_EXEC", "1") == "1"  # settle executed TPC queries by the table sqlglot's executor returns
+EXEC_TESTS = (
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+)
 STAGE = os.environ.get("BLAST_STAGE", "1") == "1"  # settle optimizer-only items by comparing the optimizer's output  # how often such a test turns out to pass
 
 
@@ -939,6 +946,16 @@ def unit_plan(ctx, bits):
                 check.append(i)
             else:
                 run.append(i)
+        if EXEC and t in EXEC_TESTS and all(i < len(fp) and fp[i] for i in idxs):
+            # settled without DuckDB: digests of what the parser, the optimizer and
+            # the transpiler return, and of the table sqlglot's executor returns
+            ms_of = lambda i: fp[i][-1] if isinstance(fp[i][-1], int) else 0  # noqa
+            run.sort(key=ms_of)
+            executed = [i for i in check if len(fp[i]) > 1]
+            est_run = (sum(ms_of(i) + 3 for i in run) / 1000.0 + (0.1 if run else 0.0)) * ctx.speed
+            est_check = (0.022 * len(executed) + 0.003 * (len(check) - len(executed))) * ctx.speed
+            cand.append((ctx.ms[n], t, None, run, check, est_run, est_check, n))
+            continue
         est_run = sum(secs[maps.units[t][i].bit_length() - 1] for i in run) * ctx.speed
         est_check = 0.022 * len(check) * ctx.speed  # parse, optimize and transpile one query
         cand.append((ctx.ms[n], t, attr, run, check, est_run, est_check, n))
@@ -956,15 +973,17 @@ def unit_plan(ctx, bits):
             continue
         without = [x for x in left if x != n]
         saving = pack_cost(left, ctx.ms) - pack_cost(without, ctx.ms)
-        fixed = (0.0 if loaded else load) + (setup if run and not fixture else 0.0)
+        fixed = (0.0 if loaded else load) + (setup if run and attr and not fixture else 0.0)
         # a failing item or a changed digest ends the work early, so a test that
         # will stay selected costs little; one that will be cleared costs it all
         cost = fixed + 0.6 * est_run + 0.5 * est_check
+        if attr is None and (fixed + est_run) * MARGIN > UNIT_WORTH * saving:
+            continue
         if UNIT_PASS * saving > cost * MARGIN:
-            jobs.append((t, attr, run, check))
+            jobs.append((t, attr, run, check, UNIT_WORTH * saving))
             cpu += fixed + est_run + est_check
             loaded = True
-            fixture = fixture or bool(run)
+            fixture = fixture or bool(run and attr)
             left = without
     return jobs, cpu
 
@@ -1037,7 +1056,21 @@ def child_main(ctx, warm, plan, verify, w):
         digests = ctx.maps.head.get("unit_fp", {})
         to_run = []
         ok = {}
-        for t, attr, run, check in jobs:  # the cheap comparison first
+        for t, attr, run, check, budget in jobs:  # the cheap comparison first
+            if attr is None:
+                fp = digests.get(t) or []
+                sp = ctx.speed
+
+                def exec_cost(i, fp=fp, sp=sp):
+                    if i < 0:
+                        return 0.022 * sp  # one comparison of the pure calls
+                    d = fp[i] if i < len(fp) and fp[i] else ()
+                    return (d[-1] + 3) / 1000.0 * sp if d and isinstance(d[-1], int) else 0.0
+
+                ok[t] = runner.items_settled(
+                    SRC, t, check, run, fp, exec_cost, lambda cpu, b=budget: cpu * MARGIN <= b
+                ) is True
+                continue
             changed = runner.items_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP) if check else []
             ok[t] = changed is not None and len(run) + len(changed) <= max(len(run), UNIT_GIVE_UP)
             if ok[t] and (run or changed):
@@ -1046,12 +1079,12 @@ def child_main(ctx, warm, plan, verify, w):
         res = runner.run_units(SRC, to_run, 4.0 * ctx.speed + 2.0) if to_run else {}
         ran = {t for t, _, _ in to_run}
         cleared = []
-        for t, attr, run, check in jobs:
+        for t, attr, run, check, budget in jobs:
             if ok[t] and (t not in ran or (res is not None and res.get(t))):
                 bits &= ~ctx.maps.test_bit(t)
                 cleared.append(t.rsplit("::", 1)[1])
         notes.append(
-            f"units {[(t.rsplit('::', 1)[1], len(r), len(c)) for t, _, r, c in jobs]} est {ucpu:.2f}s "
+            f"units {[(t.rsplit('::', 1)[1], len(r), len(c)) for t, _, r, c, _ in jobs]} est {ucpu:.2f}s "
             f"took {time.process_time() - u0:.2f}s, cleared {cleared}"
         )
         _send(w, (bits, notes))
@@ -1138,6 +1171,11 @@ def start_child(ctx, warm, plan, verify):
             except Exception:
                 pass
         finally:
+            if DEBUG:
+                import resource
+
+                ru = resource.getrusage(resource.RUSAGE_SELF)
+                os.write(2, f"self {plan.cid if hasattr(plan, 'cid') else ''} user {ru.ru_utime:.3f} sys {ru.ru_stime:.3f} minflt {ru.ru_minflt} majflt {ru.ru_majflt}\n".encode())
             os._exit(0)
     os.close(w)
     return pid, r
@@ -1159,6 +1197,13 @@ def run_children(ctx, warm, plans, jobs):
     """jobs: list of (cid, verify). Two at a time, one per core."""
     import select
 
+    if GC_FREEZE:
+        import gc
+
+        # what is loaded now is shared with every child: keep the collector from
+        # walking it there (and from dirtying the shared pages)
+        gc.collect()
+        gc.freeze()
     queue = list(jobs)
     running = {}  # fd -> [cid, pid, buffer, deadline]
     while queue or running:
@@ -1207,11 +1252,15 @@ def _finish(plans, entry, r, killed):
             os.kill(pid, 9)
         except OSError:
             pass
+    used = None
     try:
-        os.waitpid(pid, 0)
+        ru = os.wait4(pid, 0)[2]
+        used = ru.ru_utime + ru.ru_stime
     except OSError:
         pass
     plan = plans[cid]
+    if DEBUG and used is not None:
+        log(f"cpu {cid} {used:.3f}")
     frames = []
     try:
         frames = _frames(buf)
@@ -1350,7 +1399,7 @@ def main():
         workers = pack(tests, ctx.ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
-            log(cid, "FULL" if p.full else len(tests), "; ".join(p.notes)[:300])
+            log(cid, "FULL" if p.full else len(tests), "; ".join(p.notes)[-300:])
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
     log(f"done {len(ids)} commits in {time.monotonic() - T0:.2f}s wall, {time.process_time():.2f}s cpu (parent): "

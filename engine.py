@@ -298,11 +298,22 @@ def _key(k):
     return knorm(k)
 
 
+def _plain_function(f):
+    """A function written in a source file, with no closure and wrapping nothing."""
+    return (
+        f.__closure__ is None
+        and "__wrapped__" not in f.__dict__
+        and f.__code__.co_filename.endswith(".py")
+        and not f.__code__.co_filename.startswith("<")
+    )
+
+
 class Cmp:
     """Structural equality between objects built before and after a reload."""
 
     def __init__(self):
         self.class_pairs = []
+        self.default_pairs = []  # functions that differ only in default values
         self.seen = {}
         self.keep = []  # keeps compared objects alive so ids stay unique
 
@@ -407,7 +418,14 @@ class Cmp:
     def fn_same(self, f, g, d):
         if not code_same(f.__code__, g.__code__):
             return False
-        return self.fn_env_same(f, g, d)
+        if self.fn_env_same(f, g, d):
+            return True
+        if _plain_function(f) and _plain_function(g):
+            # the same body with other default values: nothing but a call can tell
+            # them apart, and the tests that make one are found by its lines
+            self.default_pairs.append((f, g))
+            return True
+        return False
 
     def fn_env_same(self, f, g, d=0):
         if not self.same(f.__defaults__, g.__defaults__, d + 1):
@@ -584,6 +602,9 @@ class Diff:
                 if a.__module__ == name and b.__module__ == name:
                     if code_same(a.__code__, b.__code__):
                         if self.cmp.fn_env_same(a, b):
+                            continue
+                        if _plain_function(a) and _plain_function(b):
+                            self.cmp.default_pairs.append((a, b))  # only its default values changed
                             continue
                     elif name in self.patched and self.cmp.fn_env_same(a, b):
                         continue  # a body edit: line coverage already selects for it
@@ -808,6 +829,12 @@ def state_diff(warm, sources, diff=True):
         i += 1
         if x is not y and getattr(x, "__module__", None) in d.purged:
             d.klass(x, y)
+    done = set()
+    for f, g in d.cmp.default_pairs:
+        if id(f) not in done:
+            done.add(id(f))
+            d.notes.append(f"defaults {f.__module__}::{f.__qualname__}")
+            d.bits |= d.cover_code(f.__code__)
     if d.name_refs:
         # Globals with no read record: select by the functions that mention the name,
         # in modules where that name is bound to the changed object itself (the home
