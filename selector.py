@@ -1225,7 +1225,7 @@ def main():
             if any(v for _, v in jobs) and VERIFY:
                 _preload_test_deps()  # before sqlglot: it checks whether unittest is loaded
             warm = engine.Warm(SRC, maps)
-            warm_cpu = time.process_time() - t0
+            warm_cpu = warm.import_cpu  # the machine's speed is judged by the import alone
             ctx.speed = min(8.0, max(1.0, warm_cpu / REF_WARM))
             # re-importing everything and comparing it costs a few times the first import
             ctx.child_limit = min(15.0, max(4.0, 25.0 * warm_cpu + 2.0))

@@ -17,6 +17,7 @@ import importlib.util
 import os
 import re
 import sys
+import time
 import types
 
 from blastkeys import ALL, cname, knorm
@@ -40,6 +41,7 @@ class Warm:
         if src not in sys.path:
             sys.path.insert(0, src)
         os.environ["SKIP_INTEGRATION"] = "0"
+        t0 = time.process_time()
         import unittest  # noqa: sqlglot validates more when it sees unittest loaded, as under pytest
 
         import sqlglot  # noqa
@@ -54,6 +56,7 @@ class Warm:
         self.files = files  # module name -> relative path
         self.modname = {rel: name for name, rel in files.items()}
         self.rdeps = self._reverse_deps()
+        self.import_cpu = time.process_time() - t0  # what a full re-import costs here
         self.xrefs = self._cross_references()
 
     def _cross_references(self):
