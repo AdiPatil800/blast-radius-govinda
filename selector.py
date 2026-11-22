@@ -186,7 +186,7 @@ def _load(path):
 
 # ---------------------------------------------------------------- one patch
 class Plan:
-    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only")
+    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only", "sites")
 
     def __init__(self):
         self.bits = 0
@@ -197,6 +197,7 @@ class Plan:
         self.data = {}  # every edited file -> new text, for code that opens it
         self.runnable = True  # tests can be run against the patched tree
         self.source_only = True  # the patch only edits sqlglot's own python files
+        self.sites = 0  # separate places where it changes code
 
 
 def read_source(rel):
@@ -586,6 +587,8 @@ def _edited_python(maps, plan, fp):
     for block_old, block_new in blocks:
         r = [(ln, t2) for ln, t2 in block_old if _matters(oi, ln, t2)]
         a = [(ln, t2) for ln, t2 in block_new if _matters(ni, ln, t2)]
+        if r or a:
+            plan.sites += 1
         aligned = (
             len(block_old) == len(block_new)
             and same_names
@@ -758,6 +761,12 @@ RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a ch
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
 INFER = os.environ.get("BLAST_INFER", "0") == "1"
 INFER_MIN = int(os.environ.get("BLAST_INFER_MIN", "1"))
+# Witnesses: when a slow test is selected for a one-place source change, run the
+# fast tests selected for the same place; if every one passes, the change is
+# taken to be invisible to the slow ones too. Off unless asked for.
+WITNESS = os.environ.get("BLAST_WITNESS", "0") == "1"
+WITNESS_MIN = int(os.environ.get("BLAST_WITNESS_MIN", "10"))
+SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
 UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))  # how often such a test turns out to pass
 
@@ -845,6 +854,40 @@ class Ctx:
         for group in seen.values():
             order.extend(group)
         return [self.id_of[n] for n in order], cpu
+
+
+def witness_plan(ctx, plan, bits):
+    """Fast tests to run as witnesses for the slow ones in the selection."""
+    if not WITNESS or ctx.calib is None or not plan.source_only or plan.sites != 1 or not plan.runnable:
+        return [], 0.0
+    nums = ctx.numbers(bits & ~ctx.maps.unit_mask)
+    slow = [n for n in nums if ctx.ms[n] >= SLOW_MS]
+    if not slow:
+        return [], 0.0
+    fast = []
+    cpu = 0.0
+    classes = set()
+    for n in nums:
+        if ctx.ms[n] >= SLOW_MS:
+            continue
+        tid = ctx.id_of[n]
+        e = ctx.est(tid)
+        if e is None:
+            return [], 0.0  # a fast test that cannot be run here: no full set of witnesses
+        fast.append((e, n))
+        cpu += e
+        cls = tid.rsplit("::", 1)[0]
+        if cls not in classes:
+            classes.add(cls)
+            cpu += ctx.speed * ctx.calib["class_cpu"].get(cls, 0.05)
+    cpu += 0.3 * ctx.speed
+    if len(fast) < WITNESS_MIN or cpu > 0.6 * pack_cost(nums, ctx.ms):
+        return [], 0.0
+    fast.sort()
+    seen = {}
+    for e, n in fast:  # cheapest first, keeping each class together
+        seen.setdefault(ctx.id_of[n].rsplit("::", 1)[0], []).append(ctx.id_of[n])
+    return [t for group in seen.values() for t in group], cpu
 
 
 def unit_plan(ctx, bits):
@@ -961,6 +1004,27 @@ def child_main(ctx, warm, plan, verify, w):
             f"units {[(t.rsplit('::', 1)[1], len(i)) for t, _, i in jobs]} est {ucpu:.2f}s "
             f"took {time.process_time() - u0:.2f}s, cleared {cleared}"
         )
+        _send(w, (bits, notes))
+    wit, wcpu = witness_plan(ctx, plan, bits)
+    if wit:
+        import runner
+
+        more_time()
+        w0 = time.process_time()
+        prepare()
+        west = {tid: ctx.est(tid) or 1.0 for tid in wit}
+        failed, _, ran = runner.run(
+            SRC, wit, lambda tid: 3.0 * west[tid] + 0.3, keep_going=lambda failed, done: not failed
+        )
+        for tid in ran:
+            if tid not in failed:
+                bits &= ~(1 << ctx.bit_of[tid])  # ran here and passed
+        if not failed and len(ran) == len(wit):
+            notes.append(f"witnesses: all {len(ran)} fast tests pass, clearing {len(ctx.numbers(bits & ~ctx.maps.unit_mask))} slow")
+            bits = 0
+        else:
+            notes.append(f"witnesses: {len(failed)} of {len(ran)} run failed")
+        notes.append(f"witness est {wcpu:.2f}s took {time.process_time() - w0:.2f}s")
         _send(w, (bits, notes))
     if not verify:
         return
@@ -1147,7 +1211,8 @@ def main():
         if p.reload:
             jobs.append((cid, p.runnable))
         elif p.runnable and p.bits and ctx.calib is not None:
-            if VERIFY or (UNITS and any(p.bits & maps.test_bit(t) for t in maps.unit_lists)):
+            slow = WITNESS and any(ctx.ms[n] >= SLOW_MS for n in ctx.numbers(p.bits & ~maps.unit_mask))
+            if VERIFY or slow or (UNITS and any(p.bits & maps.test_bit(t) for t in maps.unit_lists)):
                 jobs.append((cid, VERIFY))
     if jobs:
         warm = None
@@ -1182,7 +1247,7 @@ def main():
                     continue
                 sq = [m for m in p.src if m.startswith("sqlglot")]
                 fixed = 0.002 * len(warm.dependents(sq)) * ctx.speed + 0.01
-                if unit_plan(ctx, p.bits)[0]:
+                if unit_plan(ctx, p.bits)[0] or witness_plan(ctx, p, p.bits)[0]:
                     kept.append((cid, verify))
                 elif verify and ctx.run_set(p.bits & ~maps.unit_mask, fixed, INFER and p.source_only)[0]:
                     kept.append((cid, True))

@@ -54,6 +54,53 @@ class Warm:
         self.files = files  # module name -> relative path
         self.modname = {rel: name for name, rel in files.items()}
         self.rdeps = self._reverse_deps()
+        self.xrefs = self._cross_references()
+
+    def _cross_references(self):
+        """Entries of module-level and class-level containers that hold a class or
+        function defined in another sqlglot module: registries filled at import
+        time (the dialect table, for one). When that other module is re-imported,
+        entries left behind in a module that is not would keep the old objects
+        alive under their old names."""
+        out = {}
+
+        def scan(owner, box):
+            if isinstance(box, dict):
+                items = list(box.items())
+            elif isinstance(box, (list, set)):
+                items = [(None, v) for v in list(box)]
+            else:
+                return
+            for k, v in items:
+                if isinstance(v, (type, types.FunctionType)):
+                    m = getattr(v, "__module__", None)
+                    if m and m != owner and m in self.files:
+                        out.setdefault(m, []).append((owner, box, k, v))
+
+        seen = set()
+        for name, mod in list(sys.modules.items()):
+            if mod is None or name not in self.files or not name.startswith("sqlglot"):
+                continue
+            stack = []
+            for v in list(vars(mod).values()):
+                if isinstance(v, (dict, list, set)):
+                    scan(name, v)
+                elif isinstance(v, type) and getattr(v, "__module__", None) == name:
+                    stack.append(v)
+            while stack:
+                c = stack.pop()
+                if id(c) in seen:
+                    continue
+                seen.add(id(c))
+                for v in list(vars(c).values()):
+                    if isinstance(v, (dict, list, set)):
+                        scan(name, v)
+                    elif isinstance(v, type) and getattr(v, "__module__", None) == name:
+                        stack.append(v)
+                meta = type(c)
+                if meta is not type and getattr(meta, "__module__", None) == name and id(meta) not in seen:
+                    stack.append(meta)
+        return out
 
     def _reverse_deps(self):
         deps = {m: set(d) for m, d in self.maps.head["deps"]["deps"].items()}
@@ -164,6 +211,22 @@ def reload_patched(warm, sources, extra=()):
             if id(v) in stale or getattr(v, "__module__", None) in purge:
                 if not k.startswith("__"):
                     del ns[k]
+    # registries in modules that stay loaded must not keep objects of purged ones
+    for m in order:
+        for owner, box, k, v in warm.xrefs.get(m, ()):
+            if owner in purge:
+                continue
+            try:
+                if isinstance(box, dict):
+                    if box.get(k) is v:
+                        del box[k]
+                elif isinstance(box, list):
+                    while v in box:
+                        box.remove(v)
+                else:
+                    box.discard(v)
+            except Exception:
+                pass
     sys.meta_path.insert(0, Overlay(warm.src, sources))
     importlib.invalidate_caches()
     broken = {}
