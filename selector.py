@@ -1368,5 +1368,37 @@ def _preload_test_deps():
             pass
 
 
+def _burn():
+    """Measurement build only: a fixed amount of work after the answers are out,
+    to compare this machine's CPU speed with the one the costs were tuned on."""
+    import sys as _sys
+
+    _sys.path.insert(0, SRC)
+    t0 = time.process_time()
+    import sqlglot
+    from sqlglot.executor import execute
+    from sqlglot.optimizer import optimize
+
+    text = open(os.path.join(SRC, "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")).read()
+    stmts = [s for s in text.split(";") if "SELECT" in s.upper()][:120]
+    for _ in range(6):
+        for sql in stmts:
+            try:
+                tree = sqlglot.parse_one(sql)
+                tree.sql(dialect="duckdb")
+                optimize(tree)
+            except Exception:
+                pass
+    t1 = time.process_time()
+    rows = [{"a": i % 97, "b": i, "c": str(i % 13)} for i in range(20000)]
+    for _ in range(18):
+        execute("SELECT a, c, SUM(b) AS s, COUNT(*) AS n FROM x WHERE b % 3 <> 1 GROUP BY a, c ORDER BY s DESC LIMIT 50", tables={"x": rows})
+    t2 = time.process_time()
+    print(f"burn: parse/optimize {t1 - t0:.2f}s, execute {t2 - t1:.2f}s", file=sys.stderr)
+
+
 if __name__ == "__main__":
     main()
+    sys.stdout.flush()
+    if os.environ.get("BLAST_BURN") == "1":
+        _burn()
