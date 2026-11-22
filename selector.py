@@ -768,7 +768,7 @@ def pack_cost(tests, ms):
 
 
 # ---------------------------------------------------------------- running tests
-HEAVY_CPU = float(os.environ.get("BLAST_HEAVY", "2.5"))  # never run a test estimated above this
+HEAVY_CPU = float(os.environ.get("BLAST_HEAVY", "3.5"))  # never run a test estimated above this
 MARGIN = float(os.environ.get("BLAST_MARGIN", "0.75"))
 # Running candidate tests here costs CPU that the board charges in full (the scoring
 # machines are several times slower than where this was tuned) and buys little once
