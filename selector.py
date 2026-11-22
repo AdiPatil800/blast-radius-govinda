@@ -124,6 +124,11 @@ class Maps:
             self._subs = subs
         return self._subs.get(c) or [c]
 
+    def test_bit(self, test_id):
+        if not hasattr(self, "_bit"):
+            self._bit = {t: 1 << i for i, t in enumerate(self.tests)}
+        return self._bit.get(test_id, 0)
+
     def file_bits(self, rel):
         if self._file_bits is None:
             fb = {}
@@ -226,9 +231,15 @@ def analyze(maps, text):
                 plan.full = True
         if plan.full:
             return plan
+        python = any(p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) for p in paths)
+        if not moved and not fp.binary and _only_sql_comments(fp):
+            continue  # the fixture loader drops these lines before any test sees them
         # whoever opens the file, or lists its directory when it appears or disappears
         for p in paths:
-            plan.bits |= maps.opens.get(os.path.normpath(p), 0)
+            if not python or moved or fp.binary:
+                # (readers of an edited python file are added once it is known to
+                # differ in more than comments and layout: they parse it)
+                plan.bits |= maps.opens.get(os.path.normpath(p), 0)
             if moved:
                 plan.bits |= maps.opens.get("dir:" + (os.path.dirname(p) or "."), 0)
         if moved or fp.binary:
@@ -257,6 +268,41 @@ def analyze(maps, text):
         if plan.full:
             return plan
     return plan
+
+
+def _only_sql_comments(fp):
+    """An edit to a .sql fixture that only adds or removes empty lines and lines
+    starting with `--`. tests/helpers.py drops both before splitting statements,
+    and every .sql fixture is read through it."""
+    path = fp.old
+    if not (path and path.startswith("tests/fixtures/") and path.endswith(".sql")):
+        return False
+    changed = [t for h in fp.hunks for tag, t in h[4] if tag in "+-"]
+    if not changed or any(tag == "\\" for h in fp.hunks for tag, _ in h[4]):
+        return False
+    return all(t == "" or t.startswith("--") for t in changed)
+
+
+def _import_level_imports(focus):
+    """Modules named by import statements that run when the module is imported."""
+    out = set()
+    stack = list(focus.nodes())
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Import):
+            out.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = "." * node.level + (node.module or "")
+            out.add(base)
+            out.update(base + "." + a.name for a in node.names)
+        else:
+            stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+LAZY_LOAD_TEST = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 
 
 def _moved_python(maps, plan, fp):
@@ -349,6 +395,14 @@ def _edited_python(maps, plan, fp):
     ni = Focus(new_tree, new_lines)
     if oi.keys() == ni.keys():
         return  # comments and layout only
+    plan.bits |= maps.opens.get(os.path.normpath(rel), 0)  # tests that read this source file
+    if not is_test and _import_level_imports(ni) - _import_level_imports(oi):
+        # One test imports sqlglot in a fresh interpreter and checks that no dialect
+        # module came along; nothing recorded in this process can see that.
+        i = maps.test_bit(LAZY_LOAD_TEST)
+        if i:
+            plan.bits |= i
+            plan.notes.append(f"{rel}: new import at import level")
     if _equivalent_swaps(maps, rel, oi, ni):
         plan.notes.append(f"{rel}: comparison swap that never changes a result")
         return
