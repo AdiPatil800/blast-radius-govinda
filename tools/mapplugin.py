@@ -56,6 +56,10 @@ collect_opens = {}
 cur_collector = None
 tests = {}
 
+setup_class = None  # test class whose setUpClass is running
+setup_lines = {}  # test class -> {file: lines of setUpClass that opened it}
+setup_seen = {}  # test class -> names in its namespace before setUpClass
+class_files = {}  # "path::Class" -> {file: attributes holding its data, or None}
 bags = {}  # bag id -> list of "module:Class.attr" / "module::name" labels
 bag_of = {}  # id(original container) -> wrapper
 
@@ -142,6 +146,12 @@ def audit(event, args):
                 return  # the import system reading a source file
             if cur_opens is not None:
                 cur_opens.add(rel)
+                if setup_class is not None:
+                    f = sys._getframe(1)
+                    while f is not None and f.f_code.co_name != "setUpClass":
+                        f = f.f_back
+                    if f is not None:
+                        setup_lines.setdefault(setup_class, {}).setdefault(rel, set()).add(f.f_lineno)
             elif cur_collector is not None:
                 collect_opens.setdefault(cur_collector, set()).add(rel)
 
@@ -571,11 +581,78 @@ def _end(rec, name):
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_setup(item):
+    global setup_class
     rec = _phase(item, "setup")
+    cls = getattr(item, "cls", None)
+    first = cls is not None and cls not in setup_seen
+    if first:
+        setup_seen[cls] = set(vars(cls))
+        setup_class = cls
     try:
         return (yield)
     finally:
+        setup_class = None
         _end(rec, "setup")
+        if first:
+            try:
+                _after_class_setup(item.nodeid.rsplit("::", 1)[0], cls)
+            except Exception as e:  # pragma: no cover
+                print("class setup tracking failed", cls, e, file=sys.stderr)
+
+
+def _after_class_setup(key, cls):
+    """Data a class loads once in setUpClass lands in class attributes. Note which
+    attributes each opened file feeds, and track who reads those attributes, so a
+    change to one file selects the tests that use its data rather than the class."""
+    import ast
+    import textwrap
+
+    new = [k for k in vars(cls) if k not in setup_seen[cls] and not k.startswith("__")]
+    for k in new:
+        v = vars(cls)[k]
+        if hasattr(type(v), "__get__") or inspect.isroutine(v):
+            continue
+        setattr(cls, k, Attr(v, k))
+    files = setup_lines.get(cls)
+    if not files:
+        return
+    fn = cls.__dict__.get("setUpClass")
+    fn = getattr(fn, "__func__", None)
+    out = {f: None for f in files}
+    class_files[key] = out
+    if fn is None:
+        return
+    src = textwrap.dedent(inspect.getsource(fn))
+    tree = ast.parse(src)
+    base = fn.__code__.co_firstlineno
+    stmts = []  # (first line, last line, attributes of cls it mentions)
+    for st in tree.body[0].body:
+        names = {
+            n.attr for n in ast.walk(st)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "cls"
+        }
+        first_line = min([d.lineno for d in getattr(st, "decorator_list", ())] + [st.lineno])
+        stmts.append((base + first_line - 1, base + st.end_lineno - 1, names))
+    for f, lines in files.items():
+        attrs = set()
+        ok = True
+        for ln in lines:
+            hit = [names for a, b, names in stmts if a <= ln <= b]
+            if not hit or not hit[0]:
+                ok = False
+                break
+            attrs |= hit[0]
+        if not ok:
+            continue
+        grew = True
+        while grew:  # attributes computed from those
+            grew = False
+            for a, b, names in stmts:
+                if names & attrs and not names <= attrs:
+                    attrs |= names
+                    grew = True
+        if all(k in new for k in attrs):
+            out[f] = sorted(attrs)
 
 
 @pytest.hookimpl(wrapper=True)
@@ -622,6 +699,7 @@ def pytest_sessionfinish(session):
         class_info=class_info,
         module_order=[m for m in sys.modules if m.startswith(("sqlglot", "tests"))],
         runtime_changes=_changed_after_run(),
+        class_files=class_files,
     )
     with open(OUT, "wb") as f:
         pickle.dump(data, f)

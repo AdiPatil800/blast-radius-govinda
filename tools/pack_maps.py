@@ -37,9 +37,29 @@ def main():
 
     lines = collections.defaultdict(lambda: collections.defaultdict(int))  # file -> line -> bits
     opens = collections.defaultdict(int)
+    opens_data = collections.defaultdict(int)
     users = collections.defaultdict(int)
     attr_reads = collections.defaultdict(int)  # "cname\tattr" -> bits
     bag_reads = collections.defaultdict(lambda: collections.defaultdict(int))  # bag -> key -> bits
+    # Files a class opens once in setUpClass: when the recording says which class
+    # attributes hold their data, only the tests that read those attributes depend
+    # on the file; otherwise every test of the class does.
+    class_files = raw.get("class_files", {})
+    own_reads = collections.defaultdict(set)  # (class key, attribute) -> tests reading it in their own body
+    for t, r in tests.items():
+        k = t.rsplit("::", 1)[0]
+        mod = k.split("::")[0][:-3].replace("/", ".") + ":" + k.split("::")[1]
+        for a, b in map(_tup, r["reads"]):
+            if a == mod:
+                own_reads[(k, b)].add(t)
+    narrowed = collections.defaultdict(dict)  # class key -> file -> set of tests
+    for k, files in class_files.items():
+        for f, attrs in files.items():
+            if attrs:
+                users_ = set()
+                for a in attrs:
+                    users_ |= own_reads.get((k, a), set())
+                narrowed[k][f] = users_
     for t, r in tests.items():
         bit = 1 << idx[t]
         k = t.rsplit("::", 1)[0]
@@ -47,6 +67,10 @@ def main():
             lines[f][ln] |= bit
         for p in set(r["opens"]) | cs_opens[k]:
             opens[p] |= bit
+        # the same, counting a setUpClass file only for the tests that use its data;
+        # valid as long as setUpClass still loads the file
+        for p in set(r["opens"]) | {p for p in cs_opens[k] if p not in narrowed[k] or t in narrowed[k][p]}:
+            opens_data[p] |= bit
         for c in set(r["classes"]) | cs_classes[k]:
             users[c] |= bit
         for a, b in set(map(_tup, r["reads"])) | cs_reads[k]:
@@ -90,6 +114,7 @@ def main():
         lines={f: dict(d) for f, d in lines.items()},
         import_lines=dict(import_lines),
         opens=dict(opens),
+        opens_data={p: v for p, v in opens_data.items() if v != opens.get(p)},
         users=dict(users),
         attr_reads=dict(attr_reads),
         key_reads=key_reads,

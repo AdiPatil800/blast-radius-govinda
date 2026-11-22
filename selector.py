@@ -246,6 +246,16 @@ def analyze(maps, text):
                 plan.notes.append(f"new importable name at the top level: {p}")
         if plan.full:
             return plan
+        if moved or fp.binary:
+            plan.runnable = False
+        elif fp.hunks:
+            old = read_source(fp.old)
+            try:
+                if old is None:
+                    raise patchfmt.PatchError("missing")
+                plan.data[fp.old] = patchfmt.apply(old, fp.hunks)
+            except patchfmt.PatchError:
+                plan.runnable = False
         python = any(p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) for p in paths)
         if moved or fp.binary or not all(p.endswith(".py") and p.startswith("sqlglot/") for p in paths):
             plan.source_only = False
@@ -258,19 +268,16 @@ def analyze(maps, text):
             if not python or moved or fp.binary:
                 # (readers of an edited python file are added once it is known to
                 # differ in more than comments and layout: they parse it)
-                plan.bits |= maps.opens.get(os.path.normpath(p), 0)
+                key = os.path.normpath(p)
+                narrow = maps.head.get("opens_data", {}).get(key)
+                if narrow is not None and not moved and _sql_fixture_loads(plan, p):
+                    # loaded once per class by setUpClass, and it still loads:
+                    # only the tests that use this file's data can tell
+                    plan.bits |= narrow
+                else:
+                    plan.bits |= maps.opens.get(key, 0)
             if moved:
                 plan.bits |= maps.opens.get("dir:" + (os.path.dirname(p) or "."), 0)
-        if moved or fp.binary:
-            plan.runnable = False
-        elif fp.hunks:
-            old = read_source(fp.old)
-            try:
-                if old is None:
-                    raise patchfmt.PatchError("missing")
-                plan.data[fp.old] = patchfmt.apply(old, fp.hunks)
-            except patchfmt.PatchError:
-                plan.runnable = False
         for p in paths:
             if p.endswith(".py") and p.startswith(("sqlglot/", "tests/")):
                 break
@@ -287,6 +294,36 @@ def analyze(maps, text):
         if plan.full:
             return plan
     return plan
+
+
+_helpers = None
+
+
+def _sql_fixture_loads(plan, path):
+    """Does the patched .sql fixture still go through the suite's own loaders
+    (tests/helpers.py at the pinned commit) without raising?"""
+    global _helpers
+    text = plan.data.get(path)
+    if text is None or not path.endswith(".sql") or "tests/helpers.py" in plan.data:
+        return False
+    try:
+        if _helpers is None:
+            import importlib.util
+
+            spec = importlib.util.spec_from_file_location("blast_pinned_helpers", os.path.join(SRC, "tests", "helpers.py"))
+            _helpers = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(_helpers)
+        import tempfile
+
+        with tempfile.TemporaryDirectory(dir=TMP) as d:
+            with open(os.path.join(d, "f.sql"), "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            _helpers.FIXTURES_DIR = d
+            list(_helpers.load_sql_fixture_pairs("f.sql"))
+            list(_helpers.load_sql_fixtures("f.sql"))
+        return True
+    except Exception:
+        return False
 
 
 def _shadows_import(path):
