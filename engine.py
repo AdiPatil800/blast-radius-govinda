@@ -905,6 +905,13 @@ def _tests_using(warm, name_refs, unbound=None):
             continue
         if not word.search(text):
             continue
+        # worth parsing only if the file imports from a module that binds the name,
+        # or reaches the name as an attribute or names it in a string
+        if not any(
+            ("." + name) in text or any(("from " + home + " import") in text for home in homes)
+            for name, homes in homes_of.items()
+        ):
+            continue
         try:
             tree = ast.parse(text)
         except SyntaxError:

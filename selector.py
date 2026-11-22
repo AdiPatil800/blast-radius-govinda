@@ -775,7 +775,7 @@ WITNESS = os.environ.get("BLAST_WITNESS", "0") == "1"
 WITNESS_MIN = int(os.environ.get("BLAST_WITNESS_MIN", "10"))
 SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
-UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))
+UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.5"))
 UNIT_GIVE_UP = int(os.environ.get("BLAST_UNIT_GIVE_UP", "0"))  # more changed items than this: keep the test
 GC_FREEZE = os.environ.get("BLAST_GC_FREEZE", "1") == "1"
 UNIT_WORTH = float(os.environ.get("BLAST_UNIT_WORTH", "0.9"))  # CPU worth spending per second a cleared test saves
