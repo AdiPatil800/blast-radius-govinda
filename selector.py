@@ -1384,7 +1384,7 @@ def child_main(ctx, warm, plan, verify, w):
             notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
             bits = 0
         notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
-    if verify and PROBE:
+    if verify and PROBE and (sq or tsrc):  # (a change to data alone cannot spoil what a worker sends back)
         # Tests of a class that share a process pool: one whose worker dies, or
         # whose worker sends back something that cannot be rebuilt, breaks the
         # pool for every later test of the class.  No map shows that, so the
@@ -1700,7 +1700,7 @@ def main():
                 if unit_plan(ctx, p.bits, not any(m.startswith("tests") for m in p.src))[0] or witness_plan(ctx, p, p.bits)[0]:
                     kept.append((cid, verify))
                     continue
-                if verify and PROBE and any((p.bits >> ctx.bit_of[t]) & 1 for t in ctx.pool_tests()):
+                if verify and PROBE and p.src and any((p.bits >> ctx.bit_of[t]) & 1 for t in ctx.pool_tests()):
                     kept.append((cid, verify))  # for the pool probe
                 elif ids_run:
                     kept.append((cid, True))
