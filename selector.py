@@ -116,6 +116,16 @@ class Maps:
         return self._read_entry("k" + label)
 
     @property
+    def collect(self):
+        """{test file: {sqlglot file: lines its import runs}} (tools/collect_map.py)."""
+        if not hasattr(self, "_collect"):
+            try:
+                self._collect = _load(os.path.join(self.path, "collect.bin"))
+            except OSError:
+                self._collect = {}
+        return self._collect
+
+    @property
     def lazy(self):
         if not hasattr(self, "_lazy"):
             try:
@@ -195,7 +205,7 @@ def _load(path):
 
 # ---------------------------------------------------------------- one patch
 class Plan:
-    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only", "sites", "old")
+    __slots__ = ("bits", "full", "reload", "notes", "src", "data", "runnable", "source_only", "sites", "old", "changed")
 
     def __init__(self):
         self.bits = 0
@@ -204,6 +214,7 @@ class Plan:
         self.notes = []
         self.src = {}  # every patched python module -> (path, new source)
         self.data = {}  # every edited file -> new text, for code that opens it
+        self.changed = set()  # python files with a change that can matter when run
         self.runnable = True  # tests can be run against the patched tree
         self.source_only = True  # the patch only edits sqlglot's own python files
         self.sites = 0  # separate places where it changes code
@@ -236,6 +247,88 @@ def module_name(rel):
 
 
 def analyze(maps, text):
+    plan = _analyze(maps, text)
+    if not plan.full and maps.collect:
+        try:
+            _import_time_users(maps, plan, patchfmt.parse(text))
+        except Exception as e:  # noqa: when in doubt, everything
+            plan.full = True
+            plan.notes.append(f"import-time users: {e!r}")
+    return plan
+
+
+def _import_time_users(maps, plan, files):
+    """Test files that run sqlglot code while they are imported (a subclass of a
+    sqlglot class defined at module level runs its metaclass, say): no test's
+    coverage shows that, so the recorded lines are matched here.  A change inside
+    a function such a file runs at import, or any change to that source file
+    that is not confined to functions, selects every test of the test file."""
+    touched = {}
+    for fp in files:
+        for path in (fp.old, fp.new):
+            if path and path.startswith("sqlglot/") and path.endswith(".py"):
+                touched.setdefault(path, []).append(fp)
+    if not touched:
+        return
+    for trel, srcs in maps.collect.items():
+        hit = False
+        for rel, lines in srcs.items():
+            for fp in touched.get(rel, ()):
+                if fp.old != fp.new or fp.binary or not fp.hunks:
+                    hit = True  # moved, deleted, replaced
+                    break
+                if rel not in plan.changed:
+                    continue  # comments, layout, docstrings: nothing that runs
+                spans = _function_spans(rel)
+                if spans is None:
+                    hit = True
+                    break
+                wanted = [(a, b) for a, b in spans if any(a <= c <= b for c in lines)]
+                for old_start, _, _, _, body in fp.hunks:
+                    o = old_start
+                    for tag, _ in body:
+                        if tag == " ":
+                            o += 1
+                            continue
+                        # a removed line, or the place where one is added
+                        inside = [(a, b) for a, b in spans if a < o <= b]
+                        if not inside or any(a <= o <= b for a, b in wanted):
+                            hit = True  # at import level, or in a function run at import
+                            break
+                        if tag == "-":
+                            o += 1
+                    if hit:
+                        break
+                if hit:
+                    break
+            if hit:
+                break
+        if hit:
+            plan.bits |= maps.file_bits(trel) | maps.tests_importing(module_name(trel))
+            plan.notes.append(f"{trel} runs the changed code when imported")
+            # running them only counts with the test file imported afresh, which the
+            # in-place route does not do
+            plan.source_only = False
+
+
+def _function_spans(rel):
+    """(first line, last line) of every function in a source file at the pinned commit."""
+    text = read_source(rel)
+    if text is None:
+        return None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            out.append((first, node.end_lineno))
+    return out
+
+
+def _analyze(maps, text):
     plan = Plan()
     files = patchfmt.parse(text)
     if not files:
@@ -577,6 +670,7 @@ def _edited_python(maps, plan, fp):
         # never evaluated; nothing in sqlglot or its tests reads them back
         plan.notes.append(f"{rel}: function annotations only")
         return
+    plan.changed.add(rel)  # more than comments, layout, docstrings or dead annotations
     lines = maps.lines(rel)
     imp = maps.head["import_lines"].get(rel, frozenset())
     lazy = maps.lazy.get(rel, ())
@@ -775,7 +869,31 @@ MARGIN = float(os.environ.get("BLAST_MARGIN", "0.75"))
 # equivalent comparison swaps are recognized, so it is off unless asked for.
 VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
 VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
-REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.079"))  # warm-up CPU where the costs were measured
+REF_BENCH = float(os.environ.get("BLAST_REF_BENCH", "0.0077"))  # _bench() where the costs were measured
+BENCH_SQL = (
+    "SELECT a.x, SUM(b.y) AS s, CASE WHEN a.z > 10 THEN 'hi' ELSE 'lo' END AS c FROM t1 AS a JOIN t2 AS b "
+    "ON a.id = b.id AND b.k IN (1, 2, 3) WHERE a.d BETWEEN '2020-01-01' AND '2020-12-31' AND NOT b.f IS NULL "
+    "GROUP BY a.x, 3 HAVING SUM(b.y) > 100 ORDER BY s DESC LIMIT 10"
+)
+
+
+def _bench():
+    """CPU seconds for a fixed piece of parsing and generating (the best of a few
+    tries, after one to load what it needs)."""
+    import sqlglot
+
+    def once():
+        t = time.process_time()
+        for _ in range(12):
+            e = sqlglot.parse_one(BENCH_SQL)
+            e.sql(dialect="duckdb")
+            e.sql(dialect="bigquery", pretty=True)
+        return time.process_time() - t
+
+    once()
+    return min(once() for _ in range(5))
+
+
 TMP = os.environ.get("TMPDIR", "/tmp")
 RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a child gets once it starts running tests
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
@@ -1403,8 +1521,10 @@ def main():
             if any(v for _, v in jobs) and VERIFY:
                 _preload_test_deps()  # before sqlglot: it checks whether unittest is loaded
             warm = engine.Warm(SRC, maps)
-            warm_cpu = warm.import_cpu  # the machine's speed is judged by the import alone
-            ctx.speed = min(8.0, max(1.0, warm_cpu / REF_WARM))
+            warm_cpu = warm.import_cpu
+            # the machine's speed is judged by plain computation: an import also
+            # measures the state of the disk cache, which says nothing about tests
+            ctx.speed = min(6.0, max(1.0, _bench() / REF_BENCH))
             if os.environ.get("BLAST_SPEED"):
                 ctx.speed = float(os.environ["BLAST_SPEED"])  # for repeatable experiments
             # re-importing everything and comparing it costs a few times the first import
