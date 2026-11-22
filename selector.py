@@ -243,7 +243,7 @@ def analyze(maps, text):
                 plan.full = True
                 plan.notes.append(f"test configuration {p}")
             if base in ("pyproject.toml", "setup.cfg") and "/" not in p:
-                if moved or any("pytest" in t for h in fp.hunks for tag, t in h[4] if tag == "+"):
+                if moved or any("pytest" in t for h in fp.hunks for tag, t in h[4] if tag == "+") or not _config_parses(fp):
                     plan.full = True
                     plan.notes.append(f"test configuration {p}")
             if base in ("sitecustomize.py", "usercustomize.py"):
@@ -371,6 +371,25 @@ def _items_only(maps, plan, path, bits):
         for i in changed:
             bits |= maps.units[t][i]
     return bits
+
+
+def _config_parses(fp):
+    """pytest reads these files at start-up; one it cannot parse stops the whole run."""
+    old = read_source(fp.old)
+    try:
+        new = patchfmt.apply(old or "", fp.hunks)
+        if fp.old.endswith(".toml"):
+            import tomllib
+
+            tomllib.loads(new)
+        else:
+            import configparser
+
+            cp = configparser.RawConfigParser(strict=True, interpolation=None)
+            cp.read_string(new)
+        return True
+    except Exception:
+        return False
 
 
 def _shadows_import(path):

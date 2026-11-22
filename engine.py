@@ -475,8 +475,12 @@ class Diff:
             bits |= kr.get(k, 0)
         return bits
 
-    def cover_code(self, code):
+    def cover_code(self, code, unknown=0):
+        """Tests that run the function. `unknown` is returned for code that has no
+        source file in the tree (generated, as dataclass methods are)."""
         rel = os.path.relpath(code.co_filename, self.warm.src)
+        if rel.startswith("..") or not rel.endswith(".py"):
+            return unknown
         lines = self.maps.lines(rel)
         if not lines:
             return 0
@@ -500,6 +504,9 @@ class Diff:
                 if isinstance(b, type) and cname(a) == cname(b):
                     self.klass(a, b)
                     continue
+                # the class is gone or replaced: whoever builds or reads it can tell
+                self.notes.append(f"class removed {cname(a)}")
+                _class_everything(self, a)
                 self.global_changed(name, k, a, b, old)
                 continue
             if isinstance(a, types.FunctionType) and isinstance(b, types.FunctionType):
@@ -607,7 +614,10 @@ class Diff:
                     return  # unchanged, or a body edit that line coverage selects for
         self.notes.append(f"method {ca}.{k}")
         if isinstance(fx, types.FunctionType):
-            self.bits |= self.cover_code(_innermost(fx).__code__)
+            hit = self.cover_code(_innermost(fx).__code__, None)
+            # a generated method (a dataclass __init__ with a new default, say):
+            # no lines to go by, so everyone who builds the class
+            self.bits |= self.users(ca) if hit is None else hit
         if x is Diff:
             # a method the class did not have: it now hides the inherited one
             base = None

@@ -10,8 +10,8 @@ for f in sorted(glob.glob(os.path.join(root, "res", "*.json"))):
     r = json.load(open(f)); cid = r["id"]
     if r.get("status") != "ok" or r.get("missing"):
         continue
-    if cid in BAD:
-        continue
+    if cid in BAD or any("killed=True" in n for n in r.get("notes", [])):
+        continue  # the labeling run hung and was killed: what did not report is unknown
     src = os.path.join(root, "commits", cid + ".patch")
     if not os.path.exists(src):
         continue
