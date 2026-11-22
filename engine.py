@@ -537,6 +537,7 @@ class Diff:
         self.cmp = Cmp()
         self.done = set()
         self.purged = set()  # modules that were re-imported
+        self.unbound = {}  # name -> modules that no longer provide it
 
     # -- map lookups
     def subs(self, c):
@@ -628,6 +629,19 @@ class Diff:
                 self.global_changed(name, k, a, b, old)
 
     def global_changed(self, mod, name, a, b, old_ns):
+        if b is Diff:
+            # no longer in the module's namespace: a module with __getattr__ may
+            # still supply it (and had only cached it before)
+            now = sys.modules.get(mod)
+            if now is not None and "__getattr__" in vars(now):
+                try:
+                    b = getattr(now, name)
+                except BaseException:  # noqa
+                    b = Diff
+                if b is not Diff and a is not Diff and self.cmp.same(a, b):
+                    return
+        if b is Diff:
+            self.unbound.setdefault(name, set()).add(mod)  # `from mod import name` now fails
         self.notes.append(f"global {mod}::{name}")
         keys = _changed_keys(a, b, self.cmp)
         if keys is not None:
@@ -740,6 +754,51 @@ class Diff:
 
     name_refs = None
 
+    def lazy_names(self, m, ons, new, old_mod):
+        """A module that resolves names on demand (module __getattr__): the names its
+        tables changed for are compared by resolving them the old and the new way."""
+        nns = vars(new)
+        if "__getattr__" not in nns and "__getattr__" not in ons:
+            return
+        f, g = ons.get("__getattr__"), nns.get("__getattr__")
+        if not (isinstance(f, types.FunctionType) and isinstance(g, types.FunctionType) and code_same(f.__code__, g.__code__)):
+            if m in self.patched and isinstance(f, types.FunctionType) and isinstance(g, types.FunctionType):
+                return  # an edit to the loader's own body: selected by the lines it runs
+            self.notes.append(f"lazy loader of {m}")
+            self.bits |= self.maps.tests_importing(m)
+            return
+        names = set()
+        for k in ons.keys() | nns.keys():
+            a, b = ons.get(k), nns.get(k)
+            if not (isinstance(a, dict) or isinstance(b, dict)) or a is b:
+                continue
+            a = a if isinstance(a, dict) else {}
+            b = b if isinstance(b, dict) else {}
+            for kk in a.keys() | b.keys():
+                if isinstance(kk, str) and (kk not in a or kk not in b or not self.cmp.same(a[kk], b[kk])):
+                    names.add(kk)
+        for n in sorted(names):
+            if n in nns and n in ons:
+                continue  # bound outright on both sides: compared like any other global
+            was = ons.get(n, Diff)
+            if was is Diff and old_mod is not None:
+                try:
+                    was = getattr(old_mod, n)
+                except BaseException:  # noqa
+                    was = Diff
+            try:
+                now = getattr(new, n)
+            except BaseException:  # noqa
+                now = Diff
+            if was is Diff and now is Diff:
+                continue
+            if was is not Diff and now is not Diff and self.cmp.same(was, now):
+                continue
+            if now is Diff:
+                self.unbound.setdefault(n, set()).add(m)
+            self.notes.append(f"lazy name {m}::{n}")
+            self.name_refs.setdefault(n, []).append((m, was))
+
 
 def _changed_keys(a, b, cmp):
     """Normalized names of the entries that differ between two dicts or two sets."""
@@ -811,14 +870,15 @@ def _mentions(code, names):
     return False
 
 
-def _tests_using(warm, name_refs):
+def _tests_using(warm, name_refs, unbound=None):
     """Tests whose own code uses a changed global of sqlglot: one their file binds
     with `from <module> import <name> [as alias]`, reaches as an attribute, or
     names in a string (as mock.patch targets do).
 
     A use inside a test method selects the tests of that name; a use anywhere
     else in a test file (a helper, a class body, the module itself) selects every
-    test of the file and of the test files that import it."""
+    test of the file and of the test files that import it.  Importing a name its
+    module no longer provides (`unbound`) is such a use, wherever the import is."""
     import ast
     import re
 
@@ -860,6 +920,10 @@ def _tests_using(warm, name_refs):
                         aliases.add(a.asname or a.name)
 
         def uses(node):
+            if isinstance(node, ast.ImportFrom):
+                return bool(unbound) and node.level == 0 and any(
+                    node.module in unbound.get(x.name, ()) for x in node.names
+                )
             if isinstance(node, ast.Name):
                 return node.id in aliases
             if isinstance(node, ast.Attribute):
@@ -931,6 +995,7 @@ def state_diff(warm, sources, diff=True):
     old, order, broken, old_mods = reload_patched(warm, sources)
     d = Diff(warm, sources.keys())
     d.name_refs = {}
+    d.unbound = {}  # name -> modules that no longer provide it
     d.purged = set(order)
     maps = warm.maps
     for m in order if diff else ():
@@ -941,6 +1006,7 @@ def state_diff(warm, sources, diff=True):
         if m not in old:
             continue
         d.module(m, old[m], vars(sys.modules[m]))
+        d.lazy_names(m, old[m], sys.modules[m], old_mods.get(m))
     # classes met inside containers and objects (not named by a module or held as a
     # class attribute) are compared too, as long as their module was re-imported
     i = 0
@@ -991,7 +1057,7 @@ def state_diff(warm, sources, diff=True):
                         # only the lines that load the name can see its new value
                         d.bits |= d.cover_lines(code, lines)
     if d.name_refs:
-        hit = _tests_using(warm, d.name_refs)
+        hit = _tests_using(warm, d.name_refs, d.unbound)
         if hit:
             d.notes.append("used by test code")
             d.bits |= hit
