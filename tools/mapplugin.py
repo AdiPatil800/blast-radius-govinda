@@ -666,16 +666,18 @@ UNIT_LISTS = {
 UNITS = os.environ.get("MAP_UNITS", "1") == "1"
 
 
-unit_fp = {}  # test id -> [digest of the optimizer's output for item i, or None]
+unit_fp = {}  # test id -> [digests of what sqlglot produces for item i (see unitcheck.py)]
 
 
 def _record_units(item):
     """Run the test once per item of its list. Each run is recorded twice: whole
-    ("<id>#<i>"), and everything outside the executor's call to the optimizer
-    ("<id>#<i>@x"). A change that only reaches the optimizer part of an item can
-    then be checked by comparing the optimizer's output with the digest kept here."""
+    ("<id>#<i>"), and without what runs inside the calls that turn the query text
+    into trees or SQL ("<id>#<i>@x"): parse_one and transpile as the test module
+    calls them, and the executor's call to the optimizer. A change that reaches an
+    item only inside those calls can be settled by comparing their results with
+    the digests taken here (unitcheck.py)."""
     global cur_lines, cur_opens, cur_classes, READS
-    from blastkeys import fingerprint
+    import unitcheck
 
     attr = UNIT_LISTS[item.nodeid]
     cls = item.cls
@@ -686,31 +688,35 @@ def _record_units(item):
     holder = vars(cls).get(attr)
     full = holder.value if isinstance(holder, Attr) else getattr(cls, attr)
     method = getattr(case, item.name)
+    mod = sys.modules[cls.__module__]
     ex = sys.modules.get("sqlglot.executor")
-    real_optimize = ex.optimize
     state = {}
 
-    def optimize(*a, **k):
-        global cur_lines, cur_classes, READS
-        outer = (cur_lines, cur_classes, READS)
-        cur_lines, cur_classes, READS = state["lines"], state["classes"], state["reads"]
-        mon.restart_events()
-        try:
-            r = real_optimize(*a, **k)
-        finally:
-            cur_lines, cur_classes, READS = outer
+    def windowed(real):
+        def inner(*a, **k):
+            global cur_lines, cur_classes, READS
+            outer = (cur_lines, cur_classes, READS)
+            cur_lines, cur_classes, READS = state["lines"], state["classes"], state["reads"]
             mon.restart_events()
-        state["fp"].append(fingerprint(r))
-        return r
+            try:
+                return real(*a, **k)
+            finally:
+                cur_lines, cur_classes, READS = outer
+                mon.restart_events()
 
-    ex.optimize = optimize
-    fps = unit_fp[item.nodeid] = []
+        return inner
+
+    saved = (ex.optimize, mod.parse_one, mod.transpile)
+    ex.optimize, mod.parse_one, mod.transpile = map(windowed, saved)
     try:
         for i, one in enumerate(list(full)):
             whole = tests[f"{item.nodeid}#{i}"] = _new_rec()
             rest = tests[f"{item.nodeid}#{i}@x"] = _new_rec()
-            state.update(lines=set(), classes=set(), reads=set(), fp=[])
+            state.update(lines=set(), classes=set(), reads=set())
             setattr(cls, attr, Attr([one], attr))
+            cache = getattr(cls, "cache", None)
+            if isinstance(cache, dict):
+                cache.clear()  # so the reference query is transpiled again, as on a first run
             cur_lines, cur_opens, cur_classes, READS = rest["call"], rest["opens"], rest["classes"], set()
             mon.restart_events()
             t = time.perf_counter()
@@ -726,10 +732,16 @@ def _record_units(item):
             whole["reads"] = set(rest["reads"])
             READS = state["reads"]
             _end(whole, "call")
-            fps.append(state["fp"][0] if len(state["fp"]) == 1 else None)
     finally:
-        ex.optimize = real_optimize
+        ex.optimize, mod.parse_one, mod.transpile = saved
         setattr(cls, attr, holder if isinstance(holder, Attr) else full)
+    # the reference digests, taken the same way the selector will take them
+    if item.nodeid in unitcheck.SPECS:
+        try:
+            kind, items = unitcheck.prepare(mod, sys.modules["tests.helpers"], item.nodeid)
+            unit_fp[item.nodeid] = [unitcheck.item_digests(kind, mod, it) for it in items]
+        except BaseException as e:  # noqa
+            print("mapplugin: no digests for", item.nodeid, repr(e)[:200], file=sys.stderr)
 
 
 @pytest.hookimpl(wrapper=True)

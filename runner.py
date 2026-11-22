@@ -291,70 +291,32 @@ def run_units(src, jobs, limit_s, patch_pools=True):
     return out
 
 
-# Tests that hand each query to sqlglot.executor.execute through a process pool:
-# where their schema and queries come from, as their own setUpClass loads them.
-OPTIMIZER_STAGE = {
-    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("TPCDS_SCHEMA", "optimizer/tpc-ds/tpc-ds.sql"),
-    "tests/test_executor.py::TestExecutor::test_execute_tpch": ("TPCH_SCHEMA", "optimizer/tpc-h/tpc-h.sql"),
-}
+def items_changed(src, test_id, indices, digests, give_up=0):
+    """Items of a list-driven executor test for which sqlglot no longer produces
+    exactly what it produced at the pinned commit (see unitcheck.py).  None when
+    that cannot be told, or when more than `give_up` differ: the caller then
+    keeps the whole test.  No data is loaded and no query is executed."""
+    import unitcheck
 
-
-class _Stop(BaseException):
-    pass
-
-
-def optimizer_changed(src, test_id, indices, digests, give_up=6):
-    """For the chosen queries of an executor test: the ones for which the
-    optimizer (as sqlglot.executor.execute calls it) no longer returns exactly
-    what it returned at the pinned commit.  None when that cannot be told, or
-    when more than `give_up` differ (the caller then keeps the whole test).
-    The test's own worker function is driven up to the optimizer call and
-    stopped there, so no data is loaded and nothing is executed."""
-    spec = OPTIMIZER_STAGE.get(test_id)
-    if spec is None:
+    if test_id not in unitcheck.SPECS:
         return None
     os.chdir(src)
     try:
-        import sqlglot.executor as ex
-        from sqlglot import parse_one
-        from sqlglot.executor.table import Table
-
-        from blastkeys import fingerprint
-
-        modname = split_id(test_id)[0]
-        mod = importlib.import_module(modname)
+        mod = importlib.import_module(split_id(test_id)[0])
         helpers = importlib.import_module("tests.helpers")
-        schema = getattr(helpers, spec[0])
-        sqls = list(helpers.load_sql_fixture_pairs(spec[1]))
-        mod.initializer(schema, {name: Table(columns=cols, rows=[]) for name, cols in schema.items()})
-        real = ex.optimize
-        got = []
-
-        def optimize(*a, **k):
-            got.append(fingerprint(real(*a, **k)))
-            raise _Stop()
-
-        ex.optimize = optimize
+        kind, items = unitcheck.prepare(mod, helpers, test_id)
         changed = []
-        try:
-            for i in indices:
-                if i >= len(sqls) or i >= len(digests) or not digests[i]:
+        for i in indices:
+            if i >= len(items) or i >= len(digests) or not digests[i]:
+                return None
+            try:
+                same = unitcheck.item_digests(kind, mod, items[i]) == list(digests[i])
+            except Exception:
+                same = False  # the item now raises before anything is executed
+            if not same:
+                changed.append(i)
+                if len(changed) > give_up:
                     return None
-                meta, sql, _ = sqls[i]
-                del got[:]
-                try:
-                    expression = pickle.loads(pickle.dumps(parse_one(sql)))  # as the pool would pass it
-                    mod.mp_execute(expression, meta)
-                except _Stop:
-                    pass
-                except Exception:
-                    pass  # the item now raises before or inside the optimizer: it differs
-                if got != [digests[i]]:
-                    changed.append(i)
-                    if len(changed) > give_up:
-                        return None
-            return changed
-        finally:
-            ex.optimize = real
+        return changed
     except BaseException:  # noqa
         return None

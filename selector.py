@@ -902,10 +902,11 @@ def unit_plan(ctx, bits):
 
     Returns ([(test id, attribute, items to run, items to check)], CPU estimate).
     An item the change reaches is *run* (the whole test on that one item), unless
-    the change only reaches the item's call into the optimizer: then it is enough
-    to *check* that the optimizer still returns, for that query, exactly what it
-    returned at the pinned commit (a digest kept in the maps); the rest of the
-    item is code the change does not touch, fed the same input.
+    the change only reaches the item inside the calls that turn the query text
+    into trees and SQL (parsing, the optimizer, transpiling): then it is enough to
+    *check* that those calls still return exactly what they returned at the pinned
+    commit (digests kept in the maps); the rest of the item is code the change
+    does not touch, fed the same input.
     A test qualifies when that is expected to cost less than selecting it blind."""
     maps = ctx.maps
     if not UNITS or ctx.calib is None or not maps.unit_lists:
@@ -933,7 +934,7 @@ def unit_plan(ctx, bits):
             else:
                 run.append(i)
         est_run = sum(secs[maps.units[t][i].bit_length() - 1] for i in run) * ctx.speed
-        est_check = 0.16 * sum(secs[maps.units[t][i].bit_length() - 1] for i in check) * ctx.speed
+        est_check = 0.022 * len(check) * ctx.speed  # parse, optimize and transpile one query
         cand.append((ctx.ms[n], t, attr, run, check, est_run, est_check, n))
     if not cand:
         return [], 0.0
@@ -1026,7 +1027,7 @@ def child_main(ctx, warm, plan, verify, w):
         to_run = []
         ok = {}
         for t, attr, run, check in jobs:  # the cheap comparison first
-            changed = runner.optimizer_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP) if check else []
+            changed = runner.items_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP) if check else []
             ok[t] = changed is not None and len(run) + len(changed) <= max(len(run), UNIT_GIVE_UP)
             if ok[t] and (run or changed):
                 # items whose optimizer output moved get run in full, like the others
