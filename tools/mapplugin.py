@@ -655,6 +655,45 @@ def _after_class_setup(key, cls):
             out[f] = sorted(attrs)
 
 
+# Tests that loop over a list held in a class attribute, one independent case per
+# item. Each case is also recorded on its own, as "<test id>#<index>", by running
+# the test with the list cut down to that item.
+UNIT_LISTS = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds_sqls",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch_sqls",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch": "tpch_sqls",
+}
+UNITS = os.environ.get("MAP_UNITS", "1") == "1"
+
+
+def _record_units(item):
+    global cur_lines, cur_opens, cur_classes, READS
+    attr = UNIT_LISTS[item.nodeid]
+    cls = item.cls
+    case = getattr(item, "_testcase", None)
+    if case is None:
+        print("mapplugin: no test case for", item.nodeid, file=sys.stderr)
+        return
+    holder = vars(cls).get(attr)
+    full = holder.value if isinstance(holder, Attr) else getattr(cls, attr)
+    method = getattr(case, item.name)
+    try:
+        for i, one in enumerate(list(full)):
+            rec = tests[f"{item.nodeid}#{i}"] = _new_rec()
+            setattr(cls, attr, Attr([one], attr))
+            cur_lines, cur_opens, cur_classes, READS = rec["call"], rec["opens"], rec["classes"], set()
+            mon.restart_events()
+            t = time.perf_counter()
+            try:
+                method()
+            except BaseException as e:  # noqa
+                print("mapplugin: unit failed", item.nodeid, i, repr(e)[:200], file=sys.stderr)
+            rec["secs"] = time.perf_counter() - t
+            _end(rec, "call")
+    finally:
+        setattr(cls, attr, holder if isinstance(holder, Attr) else full)
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item):
     rec = _phase(item, "call")
@@ -664,6 +703,8 @@ def pytest_runtest_call(item):
     finally:
         rec["secs"] = time.perf_counter() - t
         _end(rec, "call")
+        if UNITS and item.nodeid in UNIT_LISTS:
+            _record_units(item)
 
 
 @pytest.hookimpl(wrapper=True)
@@ -700,6 +741,7 @@ def pytest_sessionfinish(session):
         module_order=[m for m in sys.modules if m.startswith(("sqlglot", "tests"))],
         runtime_changes=_changed_after_run(),
         class_files=class_files,
+        unit_lists=UNIT_LISTS if UNITS else {},
     )
     with open(OUT, "wb") as f:
         pickle.dump(data, f)

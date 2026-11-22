@@ -52,6 +52,15 @@ class Maps:
         self.n = len(self.tests)
         self.all_bits = (1 << self.n) - 1
         self._index = _load(os.path.join(path, "lines.idx"))
+        # list-driven tests recorded one item at a time, as "<test id>#<index>"
+        self.unit_lists = self.head.get("unit_lists", {})
+        self.units = {}
+        self.unit_mask = 0
+        for i, t in enumerate(self.tests):
+            if "#" in t:
+                base, idx = t.rsplit("#", 1)
+                self.units.setdefault(base, {})[int(idx)] = 1 << i
+                self.unit_mask |= 1 << i
         self._blob = None
         self._lines = {}
         self._reads = None
@@ -273,7 +282,7 @@ def analyze(maps, text):
                 if narrow is not None and not moved and _sql_fixture_loads(plan, p):
                     # loaded once per class by setUpClass, and it still loads:
                     # only the tests that use this file's data can tell
-                    plan.bits |= narrow
+                    plan.bits |= _items_only(maps, plan, key, narrow)
                 else:
                     plan.bits |= maps.opens.get(key, 0)
             if moved:
@@ -324,6 +333,44 @@ def _sql_fixture_loads(plan, path):
         return True
     except Exception:
         return False
+
+
+def _load_pairs(text):
+    import tempfile
+
+    with tempfile.TemporaryDirectory(dir=TMP) as d:
+        with open(os.path.join(d, "f.sql"), "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        _helpers.FIXTURES_DIR = d
+        return list(_helpers.load_sql_fixture_pairs("f.sql"))
+
+
+def _items_only(maps, plan, path, bits):
+    """For a fixture that fills a list some tests walk item by item: keep, of
+    those tests' per-item records, only the items whose content changed."""
+    attrs = None
+    for files in maps.head.get("class_files", {}).values():
+        if files.get(path):
+            attrs = files[path]
+    if not attrs or len(attrs) != 1:
+        return bits
+    tests = [t for t, a in maps.unit_lists.items() if a == attrs[0] and t in maps.units]
+    if not tests:
+        return bits
+    try:
+        old = _load_pairs(read_source(path))
+        new = _load_pairs(plan.data[path])
+    except Exception:
+        return bits
+    if len(old) != len(new) or any(len(maps.units[t]) != len(old) for t in tests):
+        return bits
+    changed = [i for i, (x, y) in enumerate(zip(old, new)) if x != y]
+    for t in tests:
+        for b in maps.units[t].values():
+            bits &= ~b
+        for i in changed:
+            bits |= maps.units[t][i]
+    return bits
 
 
 def _shadows_import(path):
@@ -672,11 +719,14 @@ MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
 # equivalent comparison swaps are recognized, so it is off unless asked for.
 VERIFY = os.environ.get("BLAST_VERIFY", "0") == "1"
 VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
-REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.55"))  # warm-up CPU where the costs were measured
+REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.095"))  # warm-up CPU where the costs were measured
 TMP = os.environ.get("TMPDIR", "/tmp")
+RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a child gets once it starts running tests
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
 INFER = os.environ.get("BLAST_INFER", "0") == "1"
 INFER_MIN = int(os.environ.get("BLAST_INFER_MIN", "1"))
+UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
+UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))  # how often such a test turns out to pass
 
 
 class Ctx:
@@ -764,6 +814,50 @@ class Ctx:
         return [self.id_of[n] for n in order], cpu
 
 
+def unit_plan(ctx, bits):
+    """List-driven tests in the selection worth running item by item.
+
+    Returns ([(test id, attribute, [item indices])], estimated CPU seconds).
+    A test qualifies when the change reaches only some of its items and running
+    those is expected to cost less than selecting the whole test blind."""
+    maps = ctx.maps
+    if not UNITS or ctx.calib is None or not maps.unit_lists:
+        return [], 0.0
+    nums = ctx.numbers(bits & ~maps.unit_mask)
+    if not nums:
+        return [], 0.0
+    secs = maps.head["secs"]
+    cand = []
+    for t, attr in maps.unit_lists.items():
+        tb = maps.test_bit(t)
+        n = ctx.number.get(t)
+        if not (bits & tb) or n is None:
+            continue
+        idxs = sorted(i for i, b in maps.units.get(t, {}).items() if bits & b)
+        if not idxs:
+            continue  # selected for a reason no single item accounts for
+        est = sum(secs[maps.units[t][i].bit_length() - 1] for i in idxs) * ctx.speed
+        cand.append((ctx.ms[n], t, attr, idxs, est, n))
+    if not cand:
+        return [], 0.0
+    cand.sort(reverse=True)
+    cls = cand[0][1].rsplit("::", 1)[0]
+    setup = ctx.speed * (ctx.calib["class_cpu"].get(cls, 0.6) + 0.3)  # class fixture, plus loading what the tests import
+    jobs, cpu = [], 0.0
+    left = list(nums)
+    for ms, t, attr, idxs, est, n in cand:
+        if t.rsplit("::", 1)[0] != cls:
+            continue
+        without = [x for x in left if x != n]
+        saving = pack_cost(left, ctx.ms) - pack_cost(without, ctx.ms)
+        cost = (0.0 if jobs else setup) + 0.6 * est
+        if UNIT_PASS * saving > cost * MARGIN:
+            jobs.append((t, attr, idxs))
+            cpu += (0.0 if len(jobs) > 1 else setup) + est
+            left = without
+    return jobs, cpu
+
+
 def _send(fd, obj):
     b = marshal.dumps(obj)
     os.write(fd, len(b).to_bytes(4, "little") + b)
@@ -777,9 +871,15 @@ def child_main(ctx, warm, plan, verify, w):
     # a patch can make sqlglot spin forever at import; CPU spent here is charged
     cpu = int(ctx.child_limit) + 1
     try:
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + int(RUN_LIMIT) + 2))
     except (ValueError, OSError):
         pass
+
+    def more_time():
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu + int(RUN_LIMIT), cpu + int(RUN_LIMIT) + 2))
+        except (ValueError, OSError):
+            pass
 
     sq = {m: v for m, v in plan.src.items() if m.startswith("sqlglot")}
     sq.update(plan.reload)
@@ -795,20 +895,53 @@ def child_main(ctx, warm, plan, verify, w):
             _send(w, (bits, notes))
             return
     _send(w, (bits, notes))
+    if not plan.runnable:
+        return
+    prepared = []
+
+    def prepare():
+        if not prepared:
+            import tempfile
+
+            import runner
+
+            _preload_test_deps()
+            tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
+            runner.prepare(SRC, tsrc, plan.data, tmp)
+            prepared.append(tmp)
+
+    # list-driven slow tests: run just the items the change reaches
+    jobs, ucpu = unit_plan(ctx, bits)
+    if jobs:
+        import runner
+
+        more_time()
+        u0 = time.process_time()
+        prepare()
+        res = runner.run_units(SRC, jobs, 4.0 * ctx.speed + 2.0)
+        cleared = []
+        for t, _, idxs in jobs:
+            if res is not None and res.get(t):
+                bits &= ~ctx.maps.test_bit(t)
+                cleared.append(t.rsplit("::", 1)[1])
+        notes.append(
+            f"units {[(t.rsplit('::', 1)[1], len(i)) for t, _, i in jobs]} est {ucpu:.2f}s "
+            f"took {time.process_time() - u0:.2f}s, cleared {cleared}"
+        )
+        _send(w, (bits, notes))
     if not verify:
         return
     fixed = 0.0 if not sq else 0.0
     infer = INFER and plan.source_only
-    ids_run, cpu = ctx.run_set(bits, fixed, infer)
+    ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer)
     if not ids_run:
         return
-    import tempfile
-
     import runner
 
+    more_time()
     t0 = time.process_time()
-    tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
-    runner.prepare(SRC, tsrc, plan.data, tmp)
+    prepare()
+    tmp = prepared[0]
     c1 = time.process_time()
     speed = ctx.speed
     cpu_of = ctx.calib["test_cpu"]
@@ -838,9 +971,6 @@ def child_main(ctx, warm, plan, verify, w):
         # take that as evidence the expensive ones pass too.
         notes.append(f"inferred {len(ctx.numbers(bits))} slow tests pass from {len(ran)} passing")
         bits = 0
-    import shutil
-
-    shutil.rmtree(tmp, ignore_errors=True)
     notes.append(f"ran {len(ran)}/{len(ids_run)} est {cpu:.2f}s prep {c1 - t0:.2f}s run {time.process_time() - c1:.2f}s, {len(failed)} failed")
     _send(w, (bits, notes))
 
@@ -910,7 +1040,10 @@ def run_children(ctx, warm, plans, jobs):
         for r in ready:
             b = os.read(r, 1 << 20)
             if b:
-                running[r][2] += b
+                entry = running[r]
+                if not entry[2]:
+                    entry[3] += RUN_LIMIT  # it answered; what follows is test running
+                entry[2] += b
                 continue
             _finish(plans, running.pop(r), r, False)
         now = time.monotonic()
@@ -980,8 +1113,9 @@ def main():
             continue
         if p.reload:
             jobs.append((cid, p.runnable))
-        elif p.runnable and p.bits and VERIFY and ctx.calib is not None:
-            jobs.append((cid, True))
+        elif p.runnable and p.bits and ctx.calib is not None:
+            if VERIFY or (UNITS and any(p.bits & maps.test_bit(t) for t in maps.unit_lists)):
+                jobs.append((cid, VERIFY))
     if jobs:
         warm = None
         try:
@@ -1015,7 +1149,9 @@ def main():
                     continue
                 sq = [m for m in p.src if m.startswith("sqlglot")]
                 fixed = 0.002 * len(warm.dependents(sq)) * ctx.speed + 0.01
-                if ctx.run_set(p.bits, fixed, INFER and p.source_only)[0]:
+                if unit_plan(ctx, p.bits)[0]:
+                    kept.append((cid, verify))
+                elif verify and ctx.run_set(p.bits & ~maps.unit_mask, fixed, INFER and p.source_only)[0]:
                     kept.append((cid, True))
             # import-time changes first: they matter most if time runs short
             kept.sort(key=lambda j: not plans[j[0]].reload)

@@ -222,3 +222,70 @@ def run(src, test_ids, limit_for, patch_pools=True, class_times=None, keep_going
     failed.update(by_key[k] for k in res.failed if k in by_key)
     ran = {by_key[k] for k in res.done if k in by_key} | failed
     return failed, {by_key[k]: v for k, v in res.times.items() if k in by_key}, ran
+
+
+def run_units(src, jobs, limit_s, patch_pools=True):
+    """Run list-driven tests one item at a time.
+
+    jobs: [(test id, class attribute holding the list, [item indices])], all of one
+    class. The class fixture is set up once; each chosen item is run as the whole
+    test with the list cut down to that item, stopping a test at its first failing
+    item. Returns {test id: True if every chosen item passed}, or None when the
+    class could not be set up (nothing is known then).
+    """
+    os.chdir(src)
+    unittest.TestCase.subTest = _sub_test
+    modname, klass, _ = split_id(jobs[0][0])
+    state = {"res": None}
+
+    def on_alarm(signum, frame):
+        res = state["res"]
+        if res is not None and res.armed:
+            res.timed_out = True
+            raise TestTimeout()
+
+    signal.signal(signal.SIGALRM, on_alarm)
+    try:
+        mod = importlib.import_module(modname)
+        if patch_pools and hasattr(mod, "ProcessPoolExecutor"):
+            mod.ProcessPoolExecutor = InlineExecutor
+        cls = getattr(mod, klass)
+        cls.setUpClass()
+    except BaseException:  # noqa
+        return None
+    out = {}
+    try:
+        for test_id, attr, indices in jobs:
+            method = split_id(test_id)[2]
+            full = list(getattr(cls, attr))
+            ok = True
+            try:
+                for i in indices:
+                    if i >= len(full):
+                        ok = False
+                        break
+                    setattr(cls, attr, [full[i]])
+                    res = Result(lambda key: limit_s)
+                    state["res"] = res
+                    try:
+                        cls(method).run(res)
+                    except BaseException:  # noqa
+                        ok = False
+                    finally:
+                        res.armed = False
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                    if res.failed or res.errors or res.failures:
+                        ok = False
+                    if not ok:
+                        break
+            finally:
+                setattr(cls, attr, full)
+            out[test_id] = ok
+    finally:
+        state["res"] = None
+        try:
+            cls.tearDownClass()
+            cls.doClassCleanups()
+        except BaseException:  # noqa
+            pass
+    return out

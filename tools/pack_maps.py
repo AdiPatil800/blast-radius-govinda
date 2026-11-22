@@ -107,7 +107,7 @@ def main():
     # its namespace actually holds after import (covers lazy re-exports)
     deps = static_imports(repo)
 
-    secs = [round(timing[t]["secs"], 4) if t in timing else 0.0 for t in ids]
+    secs = [round((timing[t] if t in timing else tests[t])["secs"], 4) for t in ids]
 
     data = dict(
         tests=ids,
@@ -115,6 +115,9 @@ def main():
         import_lines=dict(import_lines),
         opens=dict(opens),
         opens_data={p: v for p, v in opens_data.items() if v != opens.get(p)},
+        unit_lists=raw.get("unit_lists", {}),
+        class_files={k: {os.path.normpath(f): a for f, a in v.items() if not f.startswith("dir:")}
+                     for k, v in class_files.items()},
         users=dict(users),
         attr_reads=dict(attr_reads),
         key_reads=key_reads,
