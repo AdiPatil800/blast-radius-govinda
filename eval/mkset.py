@@ -4,10 +4,13 @@ root, out = sys.argv[1], sys.argv[2]
 meta = json.load(open(os.path.join(root, "commits", "meta.json")))
 os.makedirs(os.path.join(out, "commits"), exist_ok=True)
 shutil.copy("kit_x/sample/tests.json", os.path.join(out, "tests.json"))
+BAD = {"7ldn"}  # a pytest-xdist worker crashed while labeling: not a real failure
 ans = {}
 for f in sorted(glob.glob(os.path.join(root, "res", "*.json"))):
     r = json.load(open(f)); cid = r["id"]
     if r.get("status") != "ok" or r.get("missing"):
+        continue
+    if cid in BAD:
         continue
     src = os.path.join(root, "commits", cid + ".patch")
     if not os.path.exists(src):

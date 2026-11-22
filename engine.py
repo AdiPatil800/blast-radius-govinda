@@ -185,7 +185,7 @@ def reload_patched(warm, sources, extra=()):
             if sub is not None and name.startswith(prefix) and "." not in name[len(prefix):]:
                 if name[len(prefix):] not in vars(pkg):
                     setattr(pkg, name[len(prefix):], sub)
-    return old, order, broken
+    return old, order, broken, old_mods
 
 
 # ---------------------------------------------------------------- comparing
@@ -412,6 +412,31 @@ def _unwrap(v):
     return v
 
 
+def _innermost(f):
+    """The function a chain of decorators finally calls: follows __wrapped__, then
+    functions held in closure cells. A decorator's wrapper is shared by everything
+    it decorates, so its own lines say nothing about one decorated function."""
+    seen = set()
+    while isinstance(f, types.FunctionType) and id(f) not in seen:
+        seen.add(id(f))
+        nxt = f.__dict__.get("__wrapped__")
+        if not isinstance(_unwrap(nxt), types.FunctionType):
+            nxt = None
+            for cell in f.__closure__ or ():
+                try:
+                    v = _unwrap(cell.cell_contents)
+                except ValueError:
+                    continue
+                if isinstance(v, types.FunctionType):
+                    if nxt is not None:
+                        return f  # more than one candidate: stay with the wrapper
+                    nxt = v
+        if nxt is None:
+            return f
+        f = _unwrap(nxt)
+    return f
+
+
 class Diff:
     """What a reload changed, as test sets."""
 
@@ -484,7 +509,7 @@ class Diff:
                             continue
                     elif name in self.patched and self.cmp.fn_env_same(a, b):
                         continue  # a body edit: line coverage already selects for it
-                    self.bits |= self.cover_code(a.__code__)
+                    self.bits |= self.cover_code(_innermost(a).__code__)
                     self.global_changed(name, k, a, b, old)
                     continue
                 if code_same(a.__code__, b.__code__) or cname(a) == cname(b):
@@ -500,8 +525,8 @@ class Diff:
             if r is not None:
                 self.bits |= r
                 return
-        # no read record for this name: every function that mentions it
-        self.name_refs.add(name)
+        # no read record for this name: every function that can reach it
+        self.name_refs.setdefault(name, []).append((mod, a))
 
     def klass(self, a, b):
         ca = cname(a)
@@ -582,7 +607,7 @@ class Diff:
                     return  # unchanged, or a body edit that line coverage selects for
         self.notes.append(f"method {ca}.{k}")
         if isinstance(fx, types.FunctionType):
-            self.bits |= self.cover_code(fx.__code__)
+            self.bits |= self.cover_code(_innermost(fx).__code__)
         if x is Diff:
             # a method the class did not have: it now hides the inherited one
             base = None
@@ -678,9 +703,9 @@ def state_diff(warm, sources, diff=True):
     them) and just broken imports are reported.
     Returns (bits, notes, broken modules, old namespaces).
     """
-    old, order, broken = reload_patched(warm, sources)
+    old, order, broken, old_mods = reload_patched(warm, sources)
     d = Diff(warm, sources.keys())
-    d.name_refs = set()
+    d.name_refs = {}
     maps = warm.maps
     for m in order if diff else ():
         if not m.startswith("sqlglot"):
@@ -691,13 +716,26 @@ def state_diff(warm, sources, diff=True):
             continue
         d.module(m, old[m], vars(sys.modules[m]))
     if d.name_refs:
-        # globals with no read record: select by the functions that mention them
+        # Globals with no read record: select by the functions that mention the name,
+        # in modules where that name is bound to the changed object itself (the home
+        # module or a `from x import name`), or that hold the home module and may
+        # reach the name as an attribute of it.
         for m in order:
             ns = old.get(m)
             if ns is None:
                 continue
+            names = set()
+            held = {id(v) for v in ns.values() if isinstance(v, types.ModuleType)}
+            for name, homes in d.name_refs.items():
+                for home, obj in homes:
+                    if m == home or (obj is not Diff and ns.get(name, Diff) is obj):
+                        names.add(name)
+                    elif id(old_mods.get(home)) in held:
+                        names.add(name)
+            if not names:
+                continue
             for code in _codes_of(ns, m):
-                if _mentions(code, d.name_refs):
+                if _mentions(code, names):
                     d.bits |= d.cover_code(code)
     for m in broken:
         d.notes.append(f"broken {m}: {broken[m]}")

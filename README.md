@@ -16,12 +16,22 @@ pinned commit (`tools/mapplugin.py`). That run records, per test:
 `tools/pack_maps.py` packs the recording into `mapsgz/`. No patch is involved in
 building the maps.
 
+One more recording, `tools/probeplugin.py`, also comes from the pinned commit alone:
+for every single-operator comparison in sqlglot (`is`/`==`, `is not`/`!=`, `<`/`<=`,
+`>`/`>=`) it notes whether the sibling operator would ever have produced a different
+result at that source position, over every execution in the test suite. It is a value
+profile of the code, in the same spirit as line coverage: "this comparison never
+distinguishes the two operators" is the analogue of "this line never runs".
+
 At run time (`selector.py`), for each patch:
 
 1. **Data files** (fixtures and the like): the tests that open that file.
 2. **Edits inside a function body**: the tests that execute the edited statement
    (or the whole function when the edit is not a line-for-line replacement).
    Layout and comment-only edits are recognized by comparing syntax trees.
+   A patch whose only effect is to swap a comparison for its sibling at a position
+   where the two never disagreed (or that never ran) selects nothing, as does one that
+   only touches docstrings (the suite does not collect doctests).
 3. **Edits that take effect at import time** (class attributes, table entries,
    decorators, module constants, functions called during import): a forked
    child re-imports the patched module and its dependents (`engine.py`),

@@ -19,6 +19,7 @@ All records come from running the suite once at the pinned commit
 (tools/mapplugin.py).  Nothing here knows about any particular patch.
 """
 
+import ast
 import json
 import marshal
 import os
@@ -99,6 +100,15 @@ class Maps:
     def key_reads(self, label):
         """{key: tests that look it up} for one dict or set, None when not recorded."""
         return self._read_entry("k" + label)
+
+    @property
+    def probe(self):
+        if not hasattr(self, "_probe"):
+            try:
+                self._probe = _load(os.path.join(self.path, "probe.bin"))
+            except OSError:
+                self._probe = None
+        return self._probe
 
     @property
     def reads(self):
@@ -314,6 +324,13 @@ def _edited_python(maps, plan, fp):
         return
     if oi.dump() == ni.dump():
         return  # comments and layout only
+    if _equivalent_swaps(maps, rel, oi.tree, ni.tree):
+        plan.notes.append(f"{rel}: comparison swap that never changes a result")
+        return
+    if oi.dump_nodoc() == ni.dump_nodoc():
+        # only docstrings differ; nothing in the suite reads them (doctests are not collected)
+        plan.notes.append(f"{rel}: docstrings only")
+        return
     lines = maps.lines(rel)
     imp = maps.head["import_lines"].get(rel, frozenset())
     need = False
@@ -396,6 +413,55 @@ def _edited_python(maps, plan, fp):
             plan.notes.append(f"{rel}: import-time change")
 
 
+# sibling comparison operators, and the probe flag that says they once disagreed
+SWAPS = {
+    ("Is", "Eq"): 2, ("Eq", "Is"): 2, ("IsNot", "NotEq"): 4, ("NotEq", "IsNot"): 4,
+    ("Lt", "LtE"): 8, ("LtE", "Lt"): 8, ("Gt", "GtE"): 16, ("GtE", "Gt"): 16,
+}
+
+
+def _equivalent_swaps(maps, rel, old, new):
+    """True when the two trees differ only in comparison operators swapped for a
+    sibling that, over every execution in the recorded test run, gave the same
+    answer (or the comparison never ran)."""
+    probe = maps.probe
+    if probe is None:
+        return False
+    swaps = []
+    if not _same_but_ops(old, new, swaps) or not swaps:
+        return False
+    for line, col, flag in swaps:
+        f = probe.get((rel, line, col))
+        if f is None:
+            return False  # not recorded (never instrumented): no claim
+        if f & flag:
+            return False
+    return True
+
+
+def _same_but_ops(a, b, swaps):
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        if isinstance(a, ast.Compare):
+            if len(a.ops) != len(b.ops):
+                return False
+            for x, y in zip(a.ops, b.ops):
+                if type(x) is not type(y):
+                    flag = SWAPS.get((type(x).__name__, type(y).__name__))
+                    if flag is None or len(a.ops) != 1:
+                        return False
+                    swaps.append((a.lineno, a.col_offset, flag))
+            return _same_but_ops(a.left, b.left, swaps) and _same_but_ops(a.comparators, b.comparators, swaps)
+        for field in a._fields:
+            if not _same_but_ops(getattr(a, field, None), getattr(b, field, None), swaps):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same_but_ops(x, y, swaps) for x, y in zip(a, b))
+    return a == b and type(a) is type(b)
+
+
 def _indent(t):
     return len(t) - len(t.lstrip())
 
@@ -439,7 +505,10 @@ def pack_cost(tests, ms):
 # ---------------------------------------------------------------- running tests
 HEAVY_CPU = float(os.environ.get("BLAST_HEAVY", "2.5"))  # never run a test estimated above this
 MARGIN = float(os.environ.get("BLAST_MARGIN", "1.0"))
-VERIFY = os.environ.get("BLAST_VERIFY", "1") == "1"
+# Running candidate tests here costs CPU that the board charges in full (the scoring
+# machines are several times slower than where this was tuned) and buys little once
+# equivalent comparison swaps are recognized, so it is off unless asked for.
+VERIFY = os.environ.get("BLAST_VERIFY", "0") == "1"
 VERIFY_UNTIL = float(os.environ.get("BLAST_VERIFY_UNTIL", "110"))  # no new test runs after this many seconds
 REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.55"))  # warm-up CPU where the costs were measured
 TMP = os.environ.get("TMPDIR", "/tmp")
@@ -737,10 +806,11 @@ def main():
             import engine
 
             t0 = time.process_time()
-            _preload_test_deps()  # before sqlglot: it checks whether unittest is loaded
+            if any(v for _, v in jobs) and VERIFY:
+                _preload_test_deps()  # before sqlglot: it checks whether unittest is loaded
             warm = engine.Warm(SRC, maps)
             warm_cpu = time.process_time() - t0
-            ctx.speed = min(4.0, max(1.0, warm_cpu / REF_WARM))
+            ctx.speed = min(8.0, max(1.0, warm_cpu / REF_WARM))
             log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}")
             maps.reads  # the index, loaded before forking so children share it
         except Exception as e:

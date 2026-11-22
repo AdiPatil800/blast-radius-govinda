@@ -40,11 +40,32 @@ class PyInfo:
         self._walk(self.tree, "", None)
         self.scopes.sort(key=lambda s: (s.end - s.start, s.start))
         self._dump = None
+        self._nodoc = None
 
     def dump(self):
         if self._dump is None:
             self._dump = ast.dump(self.tree)
         return self._dump
+
+    def dump_nodoc(self):
+        """The tree printed with every docstring blanked."""
+        if self._nodoc is None:
+            saved = []
+            for node in ast.walk(self.tree):
+                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    body = node.body
+                    if (
+                        body
+                        and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)
+                    ):
+                        saved.append((body[0].value, body[0].value.value))
+                        body[0].value.value = ""
+            self._nodoc = ast.dump(self.tree)
+            for const, value in saved:  # the tree itself stays as parsed
+                const.value = value
+        return self._nodoc
 
     def _walk(self, node, prefix, parent):
         for child in ast.iter_child_nodes(node):
