@@ -763,6 +763,7 @@ REF_WARM = float(os.environ.get("BLAST_REF_WARM", "0.095"))  # warm-up CPU where
 TMP = os.environ.get("TMPDIR", "/tmp")
 RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a child gets once it starts running tests
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
+DROP_NAMES = [x for x in os.environ.get("BLAST_DROP_NAMES", "").split(",") if x]
 INFER = os.environ.get("BLAST_INFER", "0") == "1"
 INFER_MIN = int(os.environ.get("BLAST_INFER_MIN", "1"))
 # Witnesses: when a slow test is selected for a one-place source change, run the
@@ -1302,6 +1303,8 @@ def main():
         tests = ctx.everything if p.full else ctx.numbers(p.bits)
         if DROP_MS and not p.full:
             tests = [t for t in tests if ctx.ms[t] < DROP_MS]  # experiment: how much do slow tests cost
+        if DROP_NAMES and not p.full:
+            tests = [t for t in tests if not any(x in ctx.id_of[t] for x in DROP_NAMES)]  # experiment
         workers = pack(tests, ctx.ms)
         out.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
         if DEBUG:
