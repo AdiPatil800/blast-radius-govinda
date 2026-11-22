@@ -972,10 +972,18 @@ def _tests_using(warm, name_refs, unbound=None):
     return bits
 
 
+# Narrowing a changed global to the lines that load it needs line coverage that
+# does not depend on test order; it costs next to nothing to do without it.
+MENTION_LINES = os.environ.get("BLAST_MENTION_LINES", "0") == "1"
+
+
 def _mention_lines(code, names):
     """Lines of a function (and of what is nested in it) holding an instruction
     that names one of `names`; None when that cannot be told for every one."""
     import dis
+
+    if not MENTION_LINES:
+        return None
 
     out = set()
     stack = [code]

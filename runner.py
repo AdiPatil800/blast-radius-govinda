@@ -77,6 +77,7 @@ class Result(unittest.TestResult):
         self.done = set()
         self.keep_going = None
         self.timed_out = False
+        self._limit = 0.0
 
     def _key(self, test):
         return (type(test).__module__, type(test).__qualname__, test._testMethodName)
@@ -86,7 +87,8 @@ class Result(unittest.TestResult):
         super().startTest(test)
         self._t = time.process_time()
         self.armed = True
-        signal.setitimer(signal.ITIMER_REAL, self.limit_for(self._key(test)), 0.25)
+        self._limit = self.limit_for(self._key(test))
+        signal.setitimer(signal.ITIMER_REAL, self._limit, 0.25)
 
     def stopTest(self, test):
         self.armed = False
@@ -94,7 +96,8 @@ class Result(unittest.TestResult):
         self.times[self._key(test)] = time.process_time() - self._t
         if self.timed_out:
             self.failed.add(self._key(test))  # however it ended, a test that ran out of time fails
-            RUNAWAY.add(self._key(test))
+            if self.times[self._key(test)] >= 0.7 * self._limit:
+                RUNAWAY.add(self._key(test))  # it really used the time (a busy machine does not count)
         super().stopTest(test)
         self.done.add(self._key(test))
         if self.keep_going is not None and not self.keep_going(self):

@@ -951,6 +951,12 @@ SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
 UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.5"))
 UNIT_GIVE_UP = int(os.environ.get("BLAST_UNIT_GIVE_UP", "0"))  # more changed items than this: keep the test
+# Tests that measure memory or object lifetimes: a child here runs with a frozen
+# collector and a memory cap, so what they see is not what a real run sees.
+NO_RUN = {
+    "tests/test_generator.py::TestGenerator::test_generator_memory",
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+}
 CHILD_MEM_MB = int(os.environ.get("BLAST_CHILD_MEM_MB", "1200"))  # how much a child may grow
 GC_FREEZE = os.environ.get("BLAST_GC_FREEZE", "1") == "1"
 UNIT_WORTH = float(os.environ.get("BLAST_UNIT_WORTH", "0.9"))  # CPU worth spending per second a cleared test saves
@@ -1014,7 +1020,7 @@ class Ctx:
         for n in nums:
             tid = self.id_of[n]
             e = self.est(tid)
-            if e is None or e > HEAVY_CPU:
+            if e is None or e > HEAVY_CPU or tid in NO_RUN:
                 heavy.append(n)
             else:
                 light.append(n)
