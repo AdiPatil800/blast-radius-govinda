@@ -894,6 +894,41 @@ def _bench():
     return min(once() for _ in range(5))
 
 
+def _bench_apart():
+    """_bench() in a child, so that nothing it loads or caches stays in the process
+    every later child is forked from.  Falls back to the reference speed."""
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, 1)
+            os.write(w, repr(_bench()).encode())
+        except BaseException:  # noqa
+            pass
+        finally:
+            os._exit(0)
+    os.close(w)
+    data = b""
+    try:
+        while True:
+            chunk = os.read(r, 64)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(r)
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+    try:
+        return float(data.decode())
+    except ValueError:
+        return REF_BENCH * 3.3  # the scoring machines, as measured
+
+
 TMP = os.environ.get("TMPDIR", "/tmp")
 RUN_LIMIT = float(os.environ.get("BLAST_RUN_LIMIT", "40"))  # extra seconds a child gets once it starts running tests
 DROP_MS = int(os.environ.get("BLAST_DROP_MS", "0"))
@@ -1524,7 +1559,7 @@ def main():
             warm_cpu = warm.import_cpu
             # the machine's speed is judged by plain computation: an import also
             # measures the state of the disk cache, which says nothing about tests
-            ctx.speed = min(6.0, max(1.0, _bench() / REF_BENCH))
+            ctx.speed = min(6.0, max(1.0, _bench_apart() / REF_BENCH))
             if os.environ.get("BLAST_SPEED"):
                 ctx.speed = float(os.environ["BLAST_SPEED"])  # for repeatable experiments
             # re-importing everything and comparing it costs a few times the first import
