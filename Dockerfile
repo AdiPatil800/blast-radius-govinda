@@ -18,4 +18,6 @@ RUN gunzip /app/maps/*.gz \
  && chmod -R a+rX /app /src
 
 ENV BLAST_SRC=/src/sqlglot BLAST_MAPS=/app/maps
+# experiment: leave out tests recorded at 2 s or more, to measure what they cost on the practice set
+ENV BLAST_DROP_MS=2000
 CMD ["python", "/app/selector.py"]
