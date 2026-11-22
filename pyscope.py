@@ -1,8 +1,17 @@
-"""Where a source line sits: which function, which statement, or import-time code."""
+"""Where a source line sits: which function, which statement, or import-time code.
+
+Only the statements a patch touches are looked at.  `Focus` takes a parsed
+module and the line numbers of a change (plus the lines right around it) and
+keeps the smallest enclosing statements: module-level statements, or members of
+classes.  Two versions of a file are the same program when their focused
+statements print the same, sit at the same place in the same bodies, and those
+bodies have the same length; everything outside the focus is untouched text.
+"""
 
 import ast
 
 FUNC = (ast.FunctionDef, ast.AsyncFunctionDef)
+DOC_OWNERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
 
 class Scope:
@@ -30,66 +39,100 @@ class Scope:
         return s
 
 
-class PyInfo:
-    def __init__(self, source):
-        self.tree = ast.parse(source)
+def _span(node):
+    if isinstance(node, ast.match_case):
+        return node.pattern.lineno, node.body[-1].end_lineno
+    start = node.lineno
+    for d in getattr(node, "decorator_list", ()):
+        start = min(start, d.lineno)
+    return start, node.end_lineno
+
+
+class Focus:
+    def __init__(self, tree, lines):
+        self.tree = tree
+        self.items = []  # (class path, index in body, body length, statement, first in its body)
         self.scopes = []
         self.by_qual = {}
-        self.names = []  # qualified names of every def and class, in order
+        self.names = []  # qualified names of every def and class in focus
         self.strings = []  # (start, end) of string literals spanning lines
-        self._walk(self.tree, "", None)
+        self._pick(tree.body, "", sorted(set(lines)))
+        for prefix, _, _, node, _ in self.items:
+            self._visit(node, prefix, None)
         self.scopes.sort(key=lambda s: (s.end - s.start, s.start))
-        self._dump = None
-        self._nodoc = None
+        self._keys = None
+        self._keys_nodoc = None
 
-    def dump(self):
-        if self._dump is None:
-            self._dump = ast.dump(self.tree)
-        return self._dump
+    # -- choosing the statements
+    def _pick(self, body, prefix, lines):
+        n = len(body)
+        for i, st in enumerate(body):
+            a, b = _span(st)
+            inside = [ln for ln in lines if a <= ln <= b]
+            if not inside:
+                continue
+            if isinstance(st, ast.ClassDef) and st.body:
+                first = _span(st.body[0])[0]
+                if all(ln >= first for ln in inside):
+                    # nothing on the class line itself: look at its members instead
+                    self._pick(st.body, prefix + st.name + ".", inside)
+                    continue
+            self.items.append((prefix, i, n, st, i == 0))
 
-    def dump_nodoc(self):
-        """The tree printed with every docstring blanked."""
-        if self._nodoc is None:
+    # -- comparing two versions
+    def keys(self):
+        if self._keys is None:
+            self._keys = [(p, i, n, ast.dump(st)) for p, i, n, st, _ in self.items]
+        return self._keys
+
+    def keys_nodoc(self):
+        """Like keys(), with every docstring blanked."""
+        if self._keys_nodoc is None:
             saved = []
-            for node in ast.walk(self.tree):
-                if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                    body = node.body
-                    if (
-                        body
-                        and isinstance(body[0], ast.Expr)
-                        and isinstance(body[0].value, ast.Constant)
-                        and isinstance(body[0].value.value, str)
-                    ):
-                        saved.append((body[0].value, body[0].value.value))
-                        body[0].value.value = ""
-            self._nodoc = ast.dump(self.tree)
+            for p, i, n, st, first in self.items:
+                if first:
+                    _blank(st, saved)
+                for node in ast.walk(st):
+                    if isinstance(node, DOC_OWNERS) and node.body:
+                        _blank(node.body[0], saved)
+            self._keys_nodoc = [(p, i, n, ast.dump(st)) for p, i, n, st, _ in self.items]
             for const, value in saved:  # the tree itself stays as parsed
                 const.value = value
-        return self._nodoc
+        return self._keys_nodoc
+
+    def places(self):
+        return [(p, i, n) for p, i, n, _, _ in self.items]
+
+    def nodes(self):
+        return [st for _, _, _, st, _ in self.items]
+
+    # -- scopes inside the focus
+    def _visit(self, child, prefix, parent):
+        if isinstance(child, FUNC):
+            qual = prefix + child.name
+            start = min([d.lineno for d in child.decorator_list] + [child.lineno])
+            sc = Scope("def", start, child.end_lineno, child.body[0].lineno, qual, child, parent)
+            self.scopes.append(sc)
+            self.by_qual.setdefault(qual, sc)
+            self.names.append("def " + qual)
+            self._walk(child, qual + ".", sc)
+        elif isinstance(child, ast.Lambda):
+            sc = Scope("lambda", child.lineno, child.end_lineno, child.body.lineno, prefix + "<lambda>", child, parent)
+            self.scopes.append(sc)
+            self._walk(child, prefix, sc)
+        elif isinstance(child, ast.ClassDef):
+            qual = prefix + child.name
+            self.names.append("class " + qual)
+            self._walk(child, qual + ".", parent)
+        else:
+            if isinstance(child, (ast.Constant, ast.JoinedStr)) and child.end_lineno > child.lineno:
+                if not isinstance(child, ast.Constant) or isinstance(child.value, (str, bytes)):
+                    self.strings.append((child.lineno, child.end_lineno))
+            self._walk(child, prefix, parent)
 
     def _walk(self, node, prefix, parent):
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, FUNC):
-                qual = prefix + child.name
-                start = min([d.lineno for d in child.decorator_list] + [child.lineno])
-                sc = Scope("def", start, child.end_lineno, child.body[0].lineno, qual, child, parent)
-                self.scopes.append(sc)
-                self.by_qual.setdefault(qual, sc)
-                self.names.append("def " + qual)
-                self._walk(child, qual + ".", sc)
-            elif isinstance(child, ast.Lambda):
-                sc = Scope("lambda", child.lineno, child.end_lineno, child.body.lineno, prefix + "<lambda>", child, parent)
-                self.scopes.append(sc)
-                self._walk(child, prefix, sc)
-            elif isinstance(child, ast.ClassDef):
-                qual = prefix + child.name
-                self.names.append("class " + qual)
-                self._walk(child, qual + ".", parent)
-            else:
-                if isinstance(child, (ast.Constant, ast.JoinedStr)) and child.end_lineno > child.lineno:
-                    if not isinstance(child, ast.Constant) or isinstance(child.value, (str, bytes)):
-                        self.strings.append((child.lineno, child.end_lineno))
-                self._walk(child, prefix, parent)
+            self._visit(child, prefix, parent)
 
     def scope(self, line):
         for sc in self.scopes:  # smallest span first
@@ -112,13 +155,14 @@ class PyInfo:
             return None
 
 
-def _span(node):
-    if isinstance(node, ast.match_case):
-        return node.pattern.lineno, node.body[-1].end_lineno
-    start = node.lineno
-    for d in getattr(node, "decorator_list", ()):
-        start = min(start, d.lineno)
-    return start, node.end_lineno
+def _blank(stmt, saved):
+    if (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    ):
+        saved.append((stmt.value, stmt.value.value))
+        stmt.value.value = ""
 
 
 def _find(stmts, line):

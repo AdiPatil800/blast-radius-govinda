@@ -27,7 +27,7 @@ import sys
 import time
 
 import patchfmt
-from pyscope import PyInfo
+from pyscope import Focus
 
 T0 = time.monotonic()
 DATA = os.environ.get("BLAST_DATA", "/data")
@@ -183,13 +183,13 @@ def read_source(rel):
         return None
 
 
-_info_cache = {}
+_tree_cache = {}
 
 
-def old_info(rel, text):
-    hit = _info_cache.get(rel)
+def old_tree(rel, text):
+    hit = _tree_cache.get(rel)
     if hit is None:
-        hit = _info_cache[rel] = PyInfo(text.encode("utf-8", "surrogateescape"))
+        hit = _tree_cache[rel] = ast.parse(text.encode("utf-8", "surrogateescape"))
     return hit
 
 
@@ -312,29 +312,55 @@ def _edited_python(maps, plan, fp):
     is_test = rel.startswith("tests/")
     name = module_name(rel)
     plan.src[name] = (rel, new)
-    oi = old_info(rel, old)
     try:
-        ni = PyInfo(new.encode("utf-8", "surrogateescape"))
-    except (SyntaxError, ValueError, RecursionError) as e:
+        new_tree = ast.parse(new.encode("utf-8", "surrogateescape"))
+    except (SyntaxError, ValueError, RecursionError):
         plan.notes.append(f"{rel} no longer compiles")
         if is_test:
             plan.bits |= maps.tests_importing(name)
         else:
             plan.full = True
         return
-    if oi.dump() == ni.dump():
+
+    # the runs of removed and added lines, and the lines right around each run
+    blocks = []
+    old_lines, new_lines = set(), set()
+    for os_, ol, ns, nl, body in fp.hunks:
+        o, n = (os_ if ol else os_ + 1), (ns if nl else ns + 1)
+        block_old, block_new = [], []
+        for tag, t in body + [(" ", "")]:
+            if tag == "-":
+                block_old.append((o, t))
+                o += 1
+            elif tag == "+":
+                block_new.append((n, t))
+                n += 1
+            elif tag == " ":
+                if block_old or block_new:
+                    blocks.append((block_old, block_new))
+                    old_lines.update(ln for ln, _ in block_old)
+                    new_lines.update(ln for ln, _ in block_new)
+                    old_lines.update(((block_old[0][0] if block_old else o) - 1, o))
+                    new_lines.update(((block_new[0][0] if block_new else n) - 1, n))
+                    block_old, block_new = [], []
+                o += 1
+                n += 1
+    oi = Focus(old_tree(rel, old), old_lines)
+    ni = Focus(new_tree, new_lines)
+    if oi.keys() == ni.keys():
         return  # comments and layout only
-    if _equivalent_swaps(maps, rel, oi.tree, ni.tree):
+    if _equivalent_swaps(maps, rel, oi, ni):
         plan.notes.append(f"{rel}: comparison swap that never changes a result")
         return
-    if oi.dump_nodoc() == ni.dump_nodoc():
+    if oi.keys_nodoc() == ni.keys_nodoc():
         # only docstrings differ; nothing in the suite reads them (doctests are not collected)
         plan.notes.append(f"{rel}: docstrings only")
         return
     lines = maps.lines(rel)
     imp = maps.head["import_lines"].get(rel, frozenset())
     need = False
-    if oi.names != ni.names:
+    same_names = oi.names == ni.names
+    if not same_names:
         need = True
 
     def cover(rng):
@@ -352,57 +378,43 @@ def _edited_python(maps, plan, fp):
         return False
 
     bits = 0
-    for os_, ol, ns, nl, body in fp.hunks:
-        o, n = (os_ if ol else os_ + 1), (ns if nl else ns + 1)
-        block_old, block_new = [], []
-        for tag, t in body + [(" ", "")]:
-            if tag == "-":
-                block_old.append((o, t))
-                o += 1
-            elif tag == "+":
-                block_new.append((n, t))
-                n += 1
-            elif tag == " ":
-                if block_old or block_new:
-                    r = [(ln, t2) for ln, t2 in block_old if _matters(oi, ln, t2)]
-                    a = [(ln, t2) for ln, t2 in block_new if _matters(ni, ln, t2)]
-                    aligned = (
-                        len(block_old) == len(block_new)
-                        and oi.names == ni.names
-                        and all(_indent(x[1]) == _indent(y[1]) for x, y in zip(block_old, block_new))
-                    )
-                    for ln, _ in r:
-                        bits |= lines.get(ln, 0)
-                        sc = oi.scope(ln)
-                        if sc is None or not sc.owns_body(ln):
-                            need = True
-                            if sc is not None:
-                                bits |= cover(range(sc.start, sc.end + 1))
-                            continue
-                        if runs_at_import(sc):
-                            need = True
-                        if sc.kind == "lambda":
-                            bits |= cover(range(sc.start, sc.end + 1))
-                            continue
-                        hdr = oi.statement_lines(sc, ln) if aligned else None
-                        bits |= cover(hdr if hdr is not None else range(sc.start, sc.end + 1))
-                    if not aligned:
-                        for ln, _ in a:
-                            sc = ni.scope(ln)
-                            if sc is None or not sc.owns_body(ln):
-                                need = True
-                                continue
-                            named = sc.named()
-                            oc = oi.by_qual.get(named.qual) if named is not None else None
-                            if oc is None:
-                                need = True
-                                continue
-                            if runs_at_import(oc):
-                                need = True
-                            bits |= cover(range(oc.start, oc.end + 1))
-                    block_old, block_new = [], []
-                o += 1
-                n += 1
+    for block_old, block_new in blocks:
+        r = [(ln, t2) for ln, t2 in block_old if _matters(oi, ln, t2)]
+        a = [(ln, t2) for ln, t2 in block_new if _matters(ni, ln, t2)]
+        aligned = (
+            len(block_old) == len(block_new)
+            and same_names
+            and all(_indent(x[1]) == _indent(y[1]) for x, y in zip(block_old, block_new))
+        )
+        for ln, _ in r:
+            bits |= lines.get(ln, 0)
+            sc = oi.scope(ln)
+            if sc is None or not sc.owns_body(ln):
+                need = True
+                if sc is not None:
+                    bits |= cover(range(sc.start, sc.end + 1))
+                continue
+            if runs_at_import(sc):
+                need = True
+            if sc.kind == "lambda":
+                bits |= cover(range(sc.start, sc.end + 1))
+                continue
+            hdr = oi.statement_lines(sc, ln) if aligned else None
+            bits |= cover(hdr if hdr is not None else range(sc.start, sc.end + 1))
+        if not aligned:
+            for ln, _ in a:
+                sc = ni.scope(ln)
+                if sc is None or not sc.owns_body(ln):
+                    need = True
+                    continue
+                named = sc.named()
+                oc = oi.by_qual.get(named.qual) if named is not None else None
+                if oc is None:
+                    need = True
+                    continue
+                if runs_at_import(oc):
+                    need = True
+                bits |= cover(range(oc.start, oc.end + 1))
     plan.bits |= bits
     if need:
         if is_test:
@@ -421,14 +433,19 @@ SWAPS = {
 
 
 def _equivalent_swaps(maps, rel, old, new):
-    """True when the two trees differ only in comparison operators swapped for a
-    sibling that, over every execution in the recorded test run, gave the same
+    """True when the two versions differ only in comparison operators swapped for
+    a sibling that, over every execution in the recorded test run, gave the same
     answer (or the comparison never ran)."""
     probe = maps.probe
     if probe is None:
         return False
+    if old.places() != new.places():
+        return False
     swaps = []
-    if not _same_but_ops(old, new, swaps) or not swaps:
+    for x, y in zip(old.nodes(), new.nodes()):
+        if not _same_but_ops(x, y, swaps):
+            return False
+    if not swaps:
         return False
     for line, col, flag in swaps:
         f = probe.get((rel, line, col))
@@ -528,6 +545,7 @@ class Ctx:
         known = {n for n in self.bit_number if n is not None}
         self.unmapped = [n for n in self.everything if n not in known]
         self.speed = 2.0
+        self.child_limit = 15.0  # seconds a child may take; set from the measured warm-up
         try:
             self.calib = _load(os.path.join(MAPS, "calib.bin"))
         except OSError:
@@ -602,7 +620,16 @@ def _send(fd, obj):
 
 
 def child_main(ctx, warm, plan, verify, w):
+    import resource
+
     import engine
+
+    # a patch can make sqlglot spin forever at import; CPU spent here is charged
+    cpu = int(ctx.child_limit) + 1
+    try:
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
+    except (ValueError, OSError):
+        pass
 
     sq = {m: v for m, v in plan.src.items() if m.startswith("sqlglot")}
     sq.update(plan.reload)
@@ -718,8 +745,7 @@ def run_children(ctx, warm, plans, jobs):
                     plan.full = True
                 plan.notes.append(f"fork failed: {e!r}")
                 continue
-            limit = min(60.0, max(5.0, DEADLINE + 20 - elapsed))
-            running[r] = [cid, pid, bytearray(), time.monotonic() + limit]
+            running[r] = [cid, pid, bytearray(), time.monotonic() + ctx.child_limit]
         if not running:
             continue
         now = time.monotonic()
@@ -811,7 +837,11 @@ def main():
             warm = engine.Warm(SRC, maps)
             warm_cpu = time.process_time() - t0
             ctx.speed = min(8.0, max(1.0, warm_cpu / REF_WARM))
-            log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}")
+            # re-importing everything and comparing it costs a few times the first import
+            ctx.child_limit = min(15.0, max(4.0, 25.0 * warm_cpu + 2.0))
+            if VERIFY:
+                ctx.child_limit = max(ctx.child_limit, 30.0)
+            log(f"warm-up {warm_cpu:.2f}s cpu, speed factor {ctx.speed:.2f}, child limit {ctx.child_limit:.1f}s")
             maps.reads  # the index, loaded before forking so children share it
         except Exception as e:
             log(f"warm-up failed: {e!r}")
