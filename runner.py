@@ -303,14 +303,16 @@ class _Stop(BaseException):
     pass
 
 
-def optimizer_unchanged(src, test_id, indices, digests):
-    """For the chosen queries of an executor test, does the optimizer (as
-    sqlglot.executor.execute calls it) still return exactly what it returned at
-    the pinned commit?  The test's own worker function is driven up to that call
-    and stopped there, so no data is loaded and nothing is executed."""
+def optimizer_changed(src, test_id, indices, digests, give_up=6):
+    """For the chosen queries of an executor test: the ones for which the
+    optimizer (as sqlglot.executor.execute calls it) no longer returns exactly
+    what it returned at the pinned commit.  None when that cannot be told, or
+    when more than `give_up` differ (the caller then keeps the whole test).
+    The test's own worker function is driven up to the optimizer call and
+    stopped there, so no data is loaded and nothing is executed."""
     spec = OPTIMIZER_STAGE.get(test_id)
     if spec is None:
-        return False
+        return None
     os.chdir(src)
     try:
         import sqlglot.executor as ex
@@ -333,21 +335,26 @@ def optimizer_unchanged(src, test_id, indices, digests):
             raise _Stop()
 
         ex.optimize = optimize
+        changed = []
         try:
             for i in indices:
                 if i >= len(sqls) or i >= len(digests) or not digests[i]:
-                    return False
+                    return None
                 meta, sql, _ = sqls[i]
-                expression = pickle.loads(pickle.dumps(parse_one(sql)))  # as the pool would pass it
                 del got[:]
                 try:
+                    expression = pickle.loads(pickle.dumps(parse_one(sql)))  # as the pool would pass it
                     mod.mp_execute(expression, meta)
                 except _Stop:
                     pass
+                except Exception:
+                    pass  # the item now raises before or inside the optimizer: it differs
                 if got != [digests[i]]:
-                    return False
-            return True
+                    changed.append(i)
+                    if len(changed) > give_up:
+                        return None
+            return changed
         finally:
             ex.optimize = real
     except BaseException:  # noqa
-        return False
+        return None

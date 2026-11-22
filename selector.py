@@ -773,6 +773,7 @@ WITNESS_MIN = int(os.environ.get("BLAST_WITNESS_MIN", "10"))
 SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
 UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))
+UNIT_GIVE_UP = int(os.environ.get("BLAST_UNIT_GIVE_UP", "0"))  # more changed items than this: keep the test
 STAGE = os.environ.get("BLAST_STAGE", "1") == "1"  # settle optimizer-only items by comparing the optimizer's output  # how often such a test turns out to pass
 
 
@@ -931,7 +932,7 @@ def unit_plan(ctx, bits):
             else:
                 run.append(i)
         est_run = sum(secs[maps.units[t][i].bit_length() - 1] for i in run) * ctx.speed
-        est_check = 0.4 * sum(secs[maps.units[t][i].bit_length() - 1] for i in check) * ctx.speed
+        est_check = 0.16 * sum(secs[maps.units[t][i].bit_length() - 1] for i in check) * ctx.speed
         cand.append((ctx.ms[n], t, attr, run, check, est_run, est_check, n))
     if not cand:
         return [], 0.0
@@ -948,7 +949,9 @@ def unit_plan(ctx, bits):
         without = [x for x in left if x != n]
         saving = pack_cost(left, ctx.ms) - pack_cost(without, ctx.ms)
         fixed = (0.0 if loaded else load) + (setup if run and not fixture else 0.0)
-        cost = fixed + 0.6 * (est_run + est_check)
+        # a failing item or a changed digest ends the work early, so a test that
+        # will stay selected costs little; one that will be cleared costs it all
+        cost = fixed + 0.6 * est_run + 0.5 * est_check
         if UNIT_PASS * saving > cost * MARGIN:
             jobs.append((t, attr, run, check))
             cpu += fixed + est_run + est_check
@@ -1019,14 +1022,19 @@ def child_main(ctx, warm, plan, verify, w):
         u0 = time.process_time()
         prepare()
         digests = ctx.maps.head.get("unit_fp", {})
+        to_run = []
         ok = {}
         for t, attr, run, check in jobs:  # the cheap comparison first
-            ok[t] = not check or runner.optimizer_unchanged(SRC, t, check, digests.get(t) or [])
-        to_run = [(t, attr, run) for t, attr, run, check in jobs if ok[t] and run]
+            changed = runner.optimizer_changed(SRC, t, check, digests.get(t) or [], UNIT_GIVE_UP) if check else []
+            ok[t] = changed is not None and len(run) + len(changed) <= max(len(run), UNIT_GIVE_UP)
+            if ok[t] and (run or changed):
+                # items whose optimizer output moved get run in full, like the others
+                to_run.append((t, attr, sorted(set(run) | set(changed))))
         res = runner.run_units(SRC, to_run, 4.0 * ctx.speed + 2.0) if to_run else {}
+        ran = {t for t, _, _ in to_run}
         cleared = []
         for t, attr, run, check in jobs:
-            if ok[t] and (not run or (res is not None and res.get(t))):
+            if ok[t] and (t not in ran or (res is not None and res.get(t))):
                 bits &= ~ctx.maps.test_bit(t)
                 cleared.append(t.rsplit("::", 1)[1])
         notes.append(
@@ -1256,6 +1264,8 @@ def main():
             warm = engine.Warm(SRC, maps)
             warm_cpu = warm.import_cpu  # the machine's speed is judged by the import alone
             ctx.speed = min(8.0, max(1.0, warm_cpu / REF_WARM))
+            if os.environ.get("BLAST_SPEED"):
+                ctx.speed = float(os.environ["BLAST_SPEED"])  # for repeatable experiments
             # re-importing everything and comparing it costs a few times the first import
             ctx.child_limit = min(15.0, max(4.0, 25.0 * warm_cpu + 2.0))
             if VERIFY:
