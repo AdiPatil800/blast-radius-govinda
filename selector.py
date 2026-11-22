@@ -1022,8 +1022,6 @@ def child_main(ctx, warm, plan, verify, w):
 
             import runner
 
-            if not swapped:
-                _preload_test_deps()
             tmp = tempfile.mkdtemp(prefix="blast", dir=TMP)
             runner.prepare(SRC, tsrc, plan.data, tmp, fresh=not swapped)
             prepared.append(tmp)
@@ -1080,7 +1078,8 @@ def child_main(ctx, warm, plan, verify, w):
         _send(w, (bits, notes))
     if not verify:
         return
-    fixed = 0.03 * ctx.speed if (swapped or not sq) else 0.3 * ctx.speed
+    # after a re-import the test modules are imported again; they are small
+    fixed = (0.03 if (swapped or not sq) else 0.08) * ctx.speed
     infer = INFER and plan.source_only
     ids_run, cpu = ctx.run_set(bits & ~ctx.maps.unit_mask, fixed, infer, bool(plan.data) and not plan.src)
     if not ids_run:
