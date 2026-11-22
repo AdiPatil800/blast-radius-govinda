@@ -514,6 +514,7 @@ class Diff:
         self.notes = []
         self.cmp = Cmp()
         self.done = set()
+        self.purged = set()  # modules that were re-imported
 
     # -- map lookups
     def subs(self, c):
@@ -603,9 +604,9 @@ class Diff:
 
     def klass(self, a, b):
         ca = cname(a)
-        if ca in self.done:
+        if (id(a), id(b)) in self.done:
             return
-        self.done.add(ca)
+        self.done.add((id(a), id(b)))
         if [cname(x) for x in a.__bases__] != [cname(x) for x in b.__bases__]:
             self.notes.append(f"bases {ca}")
             self.bits |= self.users(ca)
@@ -620,7 +621,9 @@ class Diff:
             if x is y:
                 continue
             if isinstance(x, type) and isinstance(y, type) and cname(x) == cname(y):
-                if x.__module__ == a.__module__ and x.__qualname__.startswith(a.__qualname__ + "."):
+                # a class held as an attribute: a nested one, or one a metaclass made on
+                # the fly (the default tokenizer of a dialect), which no module names
+                if x is not y and getattr(x, "__module__", None) in self.purged:
                     self.klass(x, y)
                 continue
             fx, fy = _unwrap(x), _unwrap(y)
@@ -782,6 +785,7 @@ def state_diff(warm, sources, diff=True):
     old, order, broken, old_mods = reload_patched(warm, sources)
     d = Diff(warm, sources.keys())
     d.name_refs = {}
+    d.purged = set(order)
     maps = warm.maps
     for m in order if diff else ():
         if not m.startswith("sqlglot"):
