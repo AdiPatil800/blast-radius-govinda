@@ -1188,6 +1188,7 @@ def main():
         tj = json.load(f)["tests"]
     maps = Maps(MAPS)
     ctx = Ctx(maps, tj)
+    t_maps = time.process_time()
 
     commits_dir = os.path.join(DATA, "commits")
     ids = sorted(f[:-6] for f in os.listdir(commits_dir) if f.endswith(".patch"))
@@ -1203,6 +1204,7 @@ def main():
             p.notes.append(f"analysis failed: {e!r}")
             plans[cid] = p
 
+    t_plan = time.process_time()
     jobs = []
     for cid in ids:
         p = plans[cid]
@@ -1267,7 +1269,8 @@ def main():
             log(cid, "FULL" if p.full else len(tests), "; ".join(p.notes)[:300])
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
-    log(f"done {len(ids)} commits in {time.monotonic() - T0:.2f}s wall, {time.process_time():.2f}s cpu (parent)")
+    log(f"done {len(ids)} commits in {time.monotonic() - T0:.2f}s wall, {time.process_time():.2f}s cpu (parent): "
+        f"start+maps {t_maps:.2f}, analysis {t_plan - t_maps:.2f}, jobs {len(jobs)}")
 
 
 def _preload_test_deps():
