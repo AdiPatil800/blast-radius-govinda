@@ -33,3 +33,19 @@ def knorm(k, depth=0):
     if t is bytes:
         return "b" + repr(k)
     return "o" + t.__name__
+
+
+def fingerprint(expression):
+    """A digest of an expression tree: its printed form plus its serialized form
+    (which carries types and comments). Used to tell whether the optimizer still
+    produces, for a query, exactly what it produced at the pinned commit."""
+    import hashlib
+    import json
+
+    try:
+        from sqlglot import serde
+
+        payload = json.dumps(serde.dump(expression), sort_keys=True, default=repr)
+    except Exception as e:  # noqa
+        payload = "!" + repr(e)
+    return hashlib.md5((repr(expression) + "\0" + payload).encode("utf-8", "replace")).hexdigest()

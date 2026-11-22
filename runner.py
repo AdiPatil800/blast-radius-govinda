@@ -289,3 +289,65 @@ def run_units(src, jobs, limit_s, patch_pools=True):
         except BaseException:  # noqa
             pass
     return out
+
+
+# Tests that hand each query to sqlglot.executor.execute through a process pool:
+# where their schema and queries come from, as their own setUpClass loads them.
+OPTIMIZER_STAGE = {
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds": ("TPCDS_SCHEMA", "optimizer/tpc-ds/tpc-ds.sql"),
+    "tests/test_executor.py::TestExecutor::test_execute_tpch": ("TPCH_SCHEMA", "optimizer/tpc-h/tpc-h.sql"),
+}
+
+
+class _Stop(BaseException):
+    pass
+
+
+def optimizer_unchanged(src, test_id, indices, digests):
+    """For the chosen queries of an executor test, does the optimizer (as
+    sqlglot.executor.execute calls it) still return exactly what it returned at
+    the pinned commit?  The test's own worker function is driven up to that call
+    and stopped there, so no data is loaded and nothing is executed."""
+    spec = OPTIMIZER_STAGE.get(test_id)
+    if spec is None:
+        return False
+    os.chdir(src)
+    try:
+        import sqlglot.executor as ex
+        from sqlglot import parse_one
+        from sqlglot.executor.table import Table
+
+        from blastkeys import fingerprint
+
+        modname = split_id(test_id)[0]
+        mod = importlib.import_module(modname)
+        helpers = importlib.import_module("tests.helpers")
+        schema = getattr(helpers, spec[0])
+        sqls = list(helpers.load_sql_fixture_pairs(spec[1]))
+        mod.initializer(schema, {name: Table(columns=cols, rows=[]) for name, cols in schema.items()})
+        real = ex.optimize
+        got = []
+
+        def optimize(*a, **k):
+            got.append(fingerprint(real(*a, **k)))
+            raise _Stop()
+
+        ex.optimize = optimize
+        try:
+            for i in indices:
+                if i >= len(sqls) or i >= len(digests) or not digests[i]:
+                    return False
+                meta, sql, _ = sqls[i]
+                expression = pickle.loads(pickle.dumps(parse_one(sql)))  # as the pool would pass it
+                del got[:]
+                try:
+                    mod.mp_execute(expression, meta)
+                except _Stop:
+                    pass
+                if got != [digests[i]]:
+                    return False
+            return True
+        finally:
+            ex.optimize = real
+    except BaseException:  # noqa
+        return False

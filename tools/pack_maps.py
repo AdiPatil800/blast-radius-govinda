@@ -116,6 +116,7 @@ def main():
         opens=dict(opens),
         opens_data={p: v for p, v in opens_data.items() if v != opens.get(p)},
         unit_lists=raw.get("unit_lists", {}),
+        unit_fp=raw.get("unit_fp", {}),
         class_files={k: {os.path.normpath(f): a for f, a in v.items() if not f.startswith("dir:")}
                      for k, v in class_files.items()},
         users=dict(users),

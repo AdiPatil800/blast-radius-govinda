@@ -56,10 +56,14 @@ class Maps:
         self.unit_lists = self.head.get("unit_lists", {})
         self.units = {}
         self.unit_mask = 0
+        self.units_x = {}  # the same items, counting only what runs outside the optimizer
         for i, t in enumerate(self.tests):
             if "#" in t:
                 base, idx = t.rsplit("#", 1)
-                self.units.setdefault(base, {})[int(idx)] = 1 << i
+                if idx.endswith("@x"):
+                    self.units_x.setdefault(base, {})[int(idx[:-2])] = 1 << i
+                else:
+                    self.units.setdefault(base, {})[int(idx)] = 1 << i
                 self.unit_mask |= 1 << i
         self._blob = None
         self._lines = {}
@@ -367,10 +371,10 @@ def _items_only(maps, plan, path, bits):
         return bits
     changed = [i for i, (x, y) in enumerate(zip(old, new)) if x != y]
     for t in tests:
-        for b in maps.units[t].values():
+        for b in list(maps.units[t].values()) + list(maps.units_x.get(t, {}).values()):
             bits &= ~b
         for i in changed:
-            bits |= maps.units[t][i]
+            bits |= maps.units[t][i] | maps.units_x.get(t, {}).get(i, 0)  # the query itself changed
     return bits
 
 
@@ -768,7 +772,8 @@ WITNESS = os.environ.get("BLAST_WITNESS", "0") == "1"
 WITNESS_MIN = int(os.environ.get("BLAST_WITNESS_MIN", "10"))
 SLOW_MS = 2000
 UNITS = os.environ.get("BLAST_UNITS", "1") == "1"  # run list-driven tests item by item when few items are touched
-UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))  # how often such a test turns out to pass
+UNIT_PASS = float(os.environ.get("BLAST_UNIT_PASS", "0.4"))
+STAGE = os.environ.get("BLAST_STAGE", "1") == "1"  # settle optimizer-only items by comparing the optimizer's output  # how often such a test turns out to pass
 
 
 class Ctx:
@@ -891,11 +896,15 @@ def witness_plan(ctx, plan, bits):
 
 
 def unit_plan(ctx, bits):
-    """List-driven tests in the selection worth running item by item.
+    """List-driven tests in the selection that can be settled item by item.
 
-    Returns ([(test id, attribute, [item indices])], estimated CPU seconds).
-    A test qualifies when the change reaches only some of its items and running
-    those is expected to cost less than selecting the whole test blind."""
+    Returns ([(test id, attribute, items to run, items to check)], CPU estimate).
+    An item the change reaches is *run* (the whole test on that one item), unless
+    the change only reaches the item's call into the optimizer: then it is enough
+    to *check* that the optimizer still returns, for that query, exactly what it
+    returned at the pinned commit (a digest kept in the maps); the rest of the
+    item is code the change does not touch, fed the same input.
+    A test qualifies when that is expected to cost less than selecting it blind."""
     maps = ctx.maps
     if not UNITS or ctx.calib is None or not maps.unit_lists:
         return [], 0.0
@@ -903,6 +912,7 @@ def unit_plan(ctx, bits):
     if not nums:
         return [], 0.0
     secs = maps.head["secs"]
+    digests = maps.head.get("unit_fp", {})
     cand = []
     for t, attr in maps.unit_lists.items():
         tb = maps.test_bit(t)
@@ -912,24 +922,38 @@ def unit_plan(ctx, bits):
         idxs = sorted(i for i, b in maps.units.get(t, {}).items() if bits & b)
         if not idxs:
             continue  # selected for a reason no single item accounts for
-        est = sum(secs[maps.units[t][i].bit_length() - 1] for i in idxs) * ctx.speed
-        cand.append((ctx.ms[n], t, attr, idxs, est, n))
+        fp = digests.get(t) or []
+        xs = maps.units_x.get(t)
+        run, check = [], []
+        for i in idxs:
+            if STAGE and xs is not None and not (bits & xs.get(i, 0)) and i < len(fp) and fp[i]:
+                check.append(i)
+            else:
+                run.append(i)
+        est_run = sum(secs[maps.units[t][i].bit_length() - 1] for i in run) * ctx.speed
+        est_check = 0.4 * sum(secs[maps.units[t][i].bit_length() - 1] for i in check) * ctx.speed
+        cand.append((ctx.ms[n], t, attr, run, check, est_run, est_check, n))
     if not cand:
         return [], 0.0
     cand.sort(reverse=True)
     cls = cand[0][1].rsplit("::", 1)[0]
-    setup = ctx.speed * (ctx.calib["class_cpu"].get(cls, 0.6) + 0.3)  # class fixture, plus loading what the tests import
+    load = 0.3 * ctx.speed  # importing the test module and what it imports
+    setup = ctx.speed * ctx.calib["class_cpu"].get(cls, 0.6)  # the class fixture, only needed to run items
     jobs, cpu = [], 0.0
+    loaded = fixture = False
     left = list(nums)
-    for ms, t, attr, idxs, est, n in cand:
+    for ms, t, attr, run, check, est_run, est_check, n in cand:
         if t.rsplit("::", 1)[0] != cls:
             continue
         without = [x for x in left if x != n]
         saving = pack_cost(left, ctx.ms) - pack_cost(without, ctx.ms)
-        cost = (0.0 if jobs else setup) + 0.6 * est
+        fixed = (0.0 if loaded else load) + (setup if run and not fixture else 0.0)
+        cost = fixed + 0.6 * (est_run + est_check)
         if UNIT_PASS * saving > cost * MARGIN:
-            jobs.append((t, attr, idxs))
-            cpu += (0.0 if len(jobs) > 1 else setup) + est
+            jobs.append((t, attr, run, check))
+            cpu += fixed + est_run + est_check
+            loaded = True
+            fixture = fixture or bool(run)
             left = without
     return jobs, cpu
 
@@ -994,14 +1018,19 @@ def child_main(ctx, warm, plan, verify, w):
         more_time()
         u0 = time.process_time()
         prepare()
-        res = runner.run_units(SRC, jobs, 4.0 * ctx.speed + 2.0)
+        digests = ctx.maps.head.get("unit_fp", {})
+        ok = {}
+        for t, attr, run, check in jobs:  # the cheap comparison first
+            ok[t] = not check or runner.optimizer_unchanged(SRC, t, check, digests.get(t) or [])
+        to_run = [(t, attr, run) for t, attr, run, check in jobs if ok[t] and run]
+        res = runner.run_units(SRC, to_run, 4.0 * ctx.speed + 2.0) if to_run else {}
         cleared = []
-        for t, _, idxs in jobs:
-            if res is not None and res.get(t):
+        for t, attr, run, check in jobs:
+            if ok[t] and (not run or (res is not None and res.get(t))):
                 bits &= ~ctx.maps.test_bit(t)
                 cleared.append(t.rsplit("::", 1)[1])
         notes.append(
-            f"units {[(t.rsplit('::', 1)[1], len(i)) for t, _, i in jobs]} est {ucpu:.2f}s "
+            f"units {[(t.rsplit('::', 1)[1], len(r), len(c)) for t, _, r, c in jobs]} est {ucpu:.2f}s "
             f"took {time.process_time() - u0:.2f}s, cleared {cleared}"
         )
         _send(w, (bits, notes))

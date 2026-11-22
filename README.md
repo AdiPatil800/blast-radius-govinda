@@ -24,6 +24,12 @@ same spirit as line coverage: "these two operators never disagree here during th
 test" is the analogue of "this line never runs during this test". It is merged over
 several runs with different hash seeds.
 
+For the tests that hand each TPC query to the executor, the recording also notes,
+per query, what runs outside the executor's call to the optimizer, and keeps a digest
+of the optimizer's output. A change that reaches a query only inside that call is
+settled by re-running the optimizer on the query and comparing digests: same output,
+same input to everything downstream, same result. No data is loaded for this.
+
 `mapplugin.py` also records three tests that loop over a list of independent cases
 (the TPC-H and TPC-DS executor tests) once per case, so a change that reaches only a
 few cases can be checked by running just those cases instead of selecting the whole
