@@ -302,6 +302,7 @@ class Cmp:
     """Structural equality between objects built before and after a reload."""
 
     def __init__(self):
+        self.class_pairs = []
         self.seen = {}
         self.keep = []  # keeps compared objects alive so ids stay unique
 
@@ -312,7 +313,10 @@ class Cmp:
             return True
         ta, tb = type(a), type(b)
         if isinstance(a, type) or isinstance(b, type):
-            return isinstance(a, type) and isinstance(b, type) and cname(a) == cname(b)
+            if isinstance(a, type) and isinstance(b, type) and cname(a) == cname(b):
+                self.class_pairs.append((a, b))  # same name; their contents are compared separately
+                return True
+            return False
         if ta is not tb and cname(ta) != cname(tb):
             return False
         if ta in PLAIN:
@@ -795,6 +799,15 @@ def state_diff(warm, sources, diff=True):
         if m not in old:
             continue
         d.module(m, old[m], vars(sys.modules[m]))
+    # classes met inside containers and objects (not named by a module or held as a
+    # class attribute) are compared too, as long as their module was re-imported
+    i = 0
+    pairs = d.cmp.class_pairs
+    while i < len(pairs):
+        x, y = pairs[i]
+        i += 1
+        if x is not y and getattr(x, "__module__", None) in d.purged:
+            d.klass(x, y)
     if d.name_refs:
         # Globals with no read record: select by the functions that mention the name,
         # in modules where that name is bound to the changed object itself (the home
