@@ -17,5 +17,5 @@ RUN gunzip /app/maps/*.gz \
  && PYTHONDONTWRITEBYTECODE= python -m compileall -q /app /src/sqlglot/sqlglot /src/sqlglot/tests \
  && chmod -R a+rX /app /src
 
-ENV BLAST_SRC=/src/sqlglot BLAST_MAPS=/app/maps
+ENV BLAST_SRC=/src/sqlglot BLAST_MAPS=/app/maps BLAST_MARGIN=0.3 BLAST_HEAVY=8
 CMD ["python", "/app/selector.py"]
