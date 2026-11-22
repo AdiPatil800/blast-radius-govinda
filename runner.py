@@ -294,6 +294,8 @@ def run_units(src, jobs, limit_s, patch_pools=True):
 
 
 def _out_of_time(signum, frame):
+    # limits here are on CPU time used (ITIMER_PROF), so a busy machine does not
+    # make a query look stuck
     raise TestTimeout()
 
 
@@ -307,7 +309,7 @@ def items_changed(src, test_id, indices, digests, give_up=0, limit_s=3.0):
     if test_id not in unitcheck.SPECS:
         return None
     os.chdir(src)
-    signal.signal(signal.SIGALRM, _out_of_time)
+    signal.signal(signal.SIGPROF, _out_of_time)
     try:
         mod = importlib.import_module(split_id(test_id)[0])
         helpers = importlib.import_module("tests.helpers")
@@ -316,13 +318,13 @@ def items_changed(src, test_id, indices, digests, give_up=0, limit_s=3.0):
         for i in indices:
             if i >= len(items) or i >= len(digests) or not digests[i]:
                 return None
-            signal.setitimer(signal.ITIMER_REAL, limit_s)
+            signal.setitimer(signal.ITIMER_PROF, limit_s)
             try:
                 same = unitcheck.item_digests(kind, mod, items[i]) == [v for v in digests[i] if isinstance(v, str)]
             except Exception:
                 same = False  # the item now raises before anything is executed
             finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.setitimer(signal.ITIMER_PROF, 0)
             if not same:
                 changed.append(i)
                 if len(changed) > give_up:
@@ -349,7 +351,7 @@ def items_settled(src, test_id, check, run, digests, exec_cost, worth):
     if test_id not in unitcheck.SPECS:
         return None
     os.chdir(src)
-    signal.signal(signal.SIGALRM, _out_of_time)
+    signal.signal(signal.SIGPROF, _out_of_time)
     try:
         mod = importlib.import_module(split_id(test_id)[0])
         helpers = importlib.import_module("tests.helpers")
@@ -373,13 +375,13 @@ def items_settled(src, test_id, check, run, digests, exec_cost, worth):
                 return False
             # a change can make a query run practically forever: none gets more
             # than a few times what it is expected to take
-            signal.setitimer(signal.ITIMER_REAL, 0.5 + 4.0 * (exec_cost(-1) + exec_cost(i)))
+            signal.setitimer(signal.ITIMER_PROF, 0.5 + 4.0 * (exec_cost(-1) + exec_cost(i)))
             try:
                 r = unitcheck.item_same(kind, mod, items[i], digests[i], inside_only)
             except Exception:
                 r = 0
             finally:
-                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.setitimer(signal.ITIMER_PROF, 0)
             if not r:
                 return False
             if inside_only:
